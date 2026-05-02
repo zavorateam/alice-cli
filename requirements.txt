@@ -1,0 +1,7 @@
+websockets
+asyncio
+aioconsole
+playwright
+fastapi
+uvicorn
+aiohttp
