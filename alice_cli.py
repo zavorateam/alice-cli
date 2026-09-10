@@ -81,11 +81,11 @@ class AliceCliSession:
 
     def print_banner(self):
         agent = registry.get(self.current_agent)
-        eph_status = f"{ACCENT_YELLOW}[ВРЕМЕННЫЙ ЧАТ: ВКЛ]{RESET}" if self.is_ephemeral else f"{DIM}[Обычный чат]{RESET}"
+        eph_status = f"{ACCENT_YELLOW}[Временный чат: вкл]{RESET}" if self.is_ephemeral else f"{DIM}[Временный чат: выкл]{RESET}"
         print(
             f"""
 {ALICE_RED}{BOLD}    ▲   {RESET} {BOLD}Yandex Alice AI CLI{RESET}
-{ALICE_RED}{BOLD}  ▲ █ ▲ {RESET} {TEXT_MUTED}Режим:{RESET} {BOLD}{ACCENT_CYAN}[{agent.name}]{RESET} {DIM}({agent.type.upper()}){RESET} {eph_status}
+{ALICE_RED}{BOLD}    █   {RESET} {TEXT_MUTED}Режим:{RESET} {BOLD}{ACCENT_CYAN}[{agent.name}]{RESET} {DIM}({agent.type.upper()}){RESET} {eph_status}
 {ALICE_RED}{BOLD}    ▼   {RESET} {TEXT_MUTED}Введите {BOLD}help{RESET} для команд или {BOLD}list{RESET} для списка приложений.{RESET}
 """
         )
