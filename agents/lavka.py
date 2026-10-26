@@ -1,4 +1,5 @@
 import json
+import urllib.request
 from typing import Any, Dict, List
 from agents.base import AgentWidget, AliceAgent, AliceTurnResponse, SuggestionAction, decode_dialog_action
 
@@ -44,6 +45,55 @@ class LavkaAgent(AliceAgent):
             tool_output = data.get("initialToolOutput", {}).get("structuredContent", {})
             meta_tpl = data.get("meta", {}).get("outputTemplate", "")
             p_ids = tool_output.get("productIds", [])
+
+            if p_ids:
+                try:
+                    # Пробуем получить deepLinks из API Лавки
+                    req_payload = {"productIds": p_ids}
+                    if "location" in tool_output:
+                        req_payload["position"] = {"location": tool_output["location"]}
+                    elif "position" in tool_output:
+                        req_payload["position"] = tool_output["position"]
+
+                    req = urllib.request.Request(
+                        "https://lavka.yandex.ru/api/v1/providers/v1/products/list/by-id",
+                        data=json.dumps(req_payload).encode("utf-8"),
+                        headers={
+                            "Content-Type": "application/json",
+                            "User-Agent": "Mozilla/5.0",
+                            "x-lavka-web-locale": "ru-RU",
+                            "x-lavka-web-city": "213",
+                            "x-alice-agent": "true"
+                        },
+                        method="POST"
+                    )
+                    with urllib.request.urlopen(req, timeout=5.0) as response:
+                        resp_data = json.loads(response.read().decode("utf-8"))
+
+                    products = resp_data.get("products", [])
+                    if products:
+                        for p in products:
+                            dl = p.get("deepLink")
+                            title = p.get("title")
+                            if dl and title:
+                                # Формируем ссылку на карточку товара
+                                url = f"https://lavka.yandex.ru/213/good/{dl}"
+                                turn.widgets.append(AgentWidget(
+                                    component_name=ui_name,
+                                    app_id=self.app_id,
+                                    title=title,
+                                    url=url,
+                                    raw_data=p,
+                                ))
+
+                        # Если распарсили хотя бы один товар, не добавляем общую ссылку
+                        if turn.widgets:
+                            return True
+                except Exception:
+                    # Если запрос не удался (timeout/500/403), переходим к фолбэку ниже
+                    pass
+
+            # Фолбэк: если товаров нет или API недоступно, возвращаем ссылку на общую корзину
             w_title = f"Посмотрела в сервисе Лавка ({len(p_ids)} товаров)" if p_ids else "Посмотрела в сервисе Лавка"
             turn.widgets.append(AgentWidget(
                 component_name=ui_name,

@@ -19,7 +19,8 @@ except ImportError:
         readline = None
 
 from agents import SuggestionAction, registry
-from alice_server import AliceAgentManager, AliceTurnResponse, load_cookies
+from alice_server import AliceAgentManager, AliceTurnResponse
+from alice_auth import load_or_request_credentials, verify_credentials
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -305,25 +306,34 @@ class AliceCliSession:
 
 async def async_main():
     parser = argparse.ArgumentParser(description="Yandex Alice AI CLI")
-    parser.add_argument("--cookies", default=".alice_cookies", help="Путь к файлу кук (.alice_cookies)")
-    parser.add_argument("--agent", default="pro", help="Начальный агент (pro, taxi, lavka, legal, best_price...)")
-    parser.add_argument("-e", "--ephemeral", action="store_true", help="Временная сессия: удалить чат после выхода")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Компактный лог событий WS и RPC")
+    parser.add_argument("--auth", help="Токен (y0_...) или путь к файлу токена/кук")
+    parser.add_argument("--token", help="OAuth токен")
+    parser.add_argument("--cookies", help="Путь к файлу кук")
+    parser.add_argument("--agent", default="pro", help="Начальный агент")
+    parser.add_argument("-e", "--ephemeral", action="store_true", help="Временная сессия")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Лог WS и RPC")
     args = parser.parse_args()
 
-    try:
-        cookie_str, cookie_dict = load_cookies(args.cookies)
-    except Exception as e:
-        print(f"\033[31m[Ошибка]: {e}{RESET}")
+    # Разрешаем интерактивный запрос токена в консоли
+    creds = load_or_request_credentials(
+        explicit_source=args.auth or args.token or args.cookies,
+        allow_interactive=True,
+    )
+
+    if not creds:
+        print(f"\033[31m[Ошибка]: Авторизация не настроена.\033[0m")
         sys.exit(1)
 
-    print(f"{TEXT_MUTED}Проверка авторизации: прочитано {len(cookie_dict)} кук...{RESET}")
-    if "Session_id" in cookie_dict:
-        print(f"{ACCENT_GREEN}✓{RESET} Session_id найден ({cookie_dict['Session_id'][:15]}...)")
-    else:
-        print(f"\033[31m✗ Session_id отсутствует в {args.cookies}!\033[0m")
+    print(f"{TEXT_MUTED}Проверка работоспособности токена/кук...{RESET}")
+    is_ok, msg = await verify_credentials(creds)
+    if not is_ok:
+        print(f"\033[31m[Ошибка Healthcheck]: {msg}{RESET}")
+        sys.exit(1)
 
-    manager = AliceAgentManager(cookie_str, cookie_dict, verbose=args.verbose)
+    auth_str = f"OAuth ({creds.token[:10]}...)" if creds.auth_type == "token" else f"Cookies ({len(creds.cookie_dict)} шт.)"
+    print(f"{ACCENT_GREEN}✓{RESET} {msg} | Режим: {BOLD}{auth_str}{RESET} [UUID: {creds.device_uuid[:8]}...]")
+
+    manager = AliceAgentManager(creds, verbose=args.verbose)
     try:
         await manager.initialize()
     except Exception as e:

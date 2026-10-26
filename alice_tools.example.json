@@ -1,0 +1,24 @@
+{
+  "shell": {
+    "enabled": true,
+    "strict": true,
+    "allowed_commands": [
+      "ls", "cat", "head", "tail", "wc", "grep", "find",
+      "pwd", "date", "echo", "whoami", "uname", "file", "stat",
+      "du", "df", "tree", "python3", "pip"
+    ],
+    "working_directory": "/tmp",
+    "timeout_sec": 15
+  },
+  "files": {
+    "root": "/home",
+    "read_enabled": true,
+    "list_enabled": true
+  },
+  "mcpServers": {
+    "fetch": {
+      "command": "uvx",
+      "args": ["mcp-server-fetch"]
+    }
+  }
+}

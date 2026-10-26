@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Alice AI Unified Server (MCP stdio + curl HTTP API).
-Поддерживает работу со всеми приложениями и агентами Алисы.
-Включает компактный лог WS/RPC, устранение дублей виджетов и точное удаление через /dialog/remove_dialog.
+Alice AI Unified Server.
+Парсит neuro_structured_blocks_card: Markdown → ответ, ReasoningSummary → thinking_steps.
 """
 
 import argparse
@@ -10,90 +9,153 @@ import asyncio
 import inspect
 import json
 import logging
+import mimetypes
 import os
 import sys
 import time
 import uuid
-from datetime import datetime
 from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Tuple
+from datetime import datetime
 
 import aiohttp
 import websockets
 
-from agents import AgentWidget, AliceAgent, AliceTurnResponse, SuggestionAction, registry
+from agents import AgentWidget, AliceAgent, AliceTurnResponse, SuggestionAction, ThinkingStep, registry
+from alice_auth import (
+    AliceCredentials,
+    load_or_request_credentials,
+    resolve_auth_source,
+    verify_credentials,
+)
 
 WEBSOCKET_URI = "wss://uniproxy.alice.yandex.ru/uni.ws"
 RPC_BASE_URL = "https://rpc.alice.yandex.ru"
 ORIGIN = "https://alice.yandex.ru"
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:154.0) Gecko/20100101 Firefox/154.0"
-COOKIE_FILE_DEFAULT = ".alice_cookies"
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:158.0) Gecko/20100101 Firefox/158.0"
 
 DEFAULT_EXPERIMENTS = [
-    "dont_skip_cancel_requests",
-    "enable_parallel_requests_to_chats",
-    "read_dialogs_for_unauthorized_users",
-    "mm_allow_anonymous_request",
+    "dont_skip_cancel_requests", "enable_parallel_requests_to_chats",
+    "read_dialogs_for_unauthorized_users", "mm_allow_anonymous_request",
     "enable_external_skills_for_webdesktop_and_webtouch",
     "send_show_view_directive_on_supports_show_view_layer_content_interface",
-    "standalone_alice_2_0",
-    "mm_enable_protocol_scenario=WebAliceControls",
-    "exp_flag_chat_dialog_history",
-    "exp_flag_chat_dialog_history_main_context_save",
-    "div2cards_in_external_skills_for_web_standalone",
-    "enable_find_poi_standalone",
-    "use_server_pings",
-    "enable_onboarding_adaptive_size",
+    "standalone_alice_2_0", "mm_enable_protocol_scenario=WebAliceControls",
+    "exp_flag_chat_dialog_history", "exp_flag_chat_dialog_history_main_context_save",
+    "div2cards_in_external_skills_for_web_standalone", "enable_find_poi_standalone",
+    "use_server_pings", "enable_onboarding_adaptive_size",
     "standalone_show_fullscreen_image_gallery_directive",
-    "draw_picture_enable_controls",
-    "alice_has_borders_div_paddings",
+    "draw_picture_enable_controls", "alice_has_borders_div_paddings",
     "enable_new_colors_for_alice_chat",
     "erase_serialized_response_from_json_deferred_alice_response",
-    "skills_standalone_use_div_render",
-    "standalone_skill_card_cloud_ui",
+    "skills_standalone_use_div_render", "standalone_skill_card_cloud_ui",
 ]
 
 DEFAULT_SUPPORTED_FEATURES = [
     "background_response_streaming_for_dialog_controls",
     "background_response_streaming_in_read_dialog",
-    "background_response_streaming",
-    "background_response_streaming_anon",
-    "supports_bso_answer",
-    "open_link",
-    "server_action",
-    "show_promo",
-    "reminders_and_todos",
-    "div2_cards",
-    "player_pause_directive",
-    "can_open_dialogs_in_tabs",
-    "supports_streaming_response",
-    "supports_rich_json_cards",
-    "builtin_reaction",
-    "open_link_by_button",
-    "supports_origin_in_separate_card",
-    "supports_new_sources_cards",
-    "supports_markdown_response",
-    "supported_save_chathistory",
-    "supported_load_chathistory",
-    "supports_unlimited_dialogs_creation",
-    "supports_multi_model_dialogs",
-    "print_text_in_message_view",
-    "show_loader_directive",
-    "supports_stringbody_in_div2_card",
-    "supports_default_dialog_as_dedicated",
-    "whisper",
+    "background_response_streaming", "background_response_streaming_anon",
+    "supports_bso_answer", "open_link", "server_action", "show_promo",
+    "reminders_and_todos", "div2_cards", "player_pause_directive",
+    "can_open_dialogs_in_tabs", "supports_streaming_response",
+    "supports_rich_json_cards", "builtin_reaction", "open_link_by_button",
+    "supports_origin_in_separate_card", "supports_new_sources_cards",
+    "supports_markdown_response", "supported_save_chathistory",
+    "supported_load_chathistory", "supports_unlimited_dialogs_creation",
+    "supports_multi_model_dialogs", "print_text_in_message_view",
+    "show_loader_directive", "supports_stringbody_in_div2_card",
+    "supports_default_dialog_as_dedicated", "whisper",
 ]
 
 logger = logging.getLogger("alice_server")
 
 
+def uuid7() -> str:
+    """RFC 9562 UUIDv7 — совместим с форматом dialog_id Яндекса."""
+    ms = int(time.time() * 1000)
+    b = bytearray(ms.to_bytes(6, "big") + os.urandom(10))
+    b[6] = (b[6] & 0x0F) | 0x70
+    b[8] = (b[8] & 0x3F) | 0x80
+    h = bytes(b).hex()
+    return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
+
+
+def _parse_nsb_card(card: Dict[str, Any]) -> Tuple[str, List[ThinkingStep], List[Dict[str, Any]]]:
+    """
+    Разбирает neuro_structured_blocks_card.
+    Возвращает (answer_text, thinking_steps, sources).
+    НЕ использует plain_text, если есть json_structured_data.
+    """
+    nsb = card.get("neuro_structured_blocks_card")
+    if not nsb:
+        return "", [], []
+
+    structured = nsb.get("json_structured_data")
+    if not structured:
+        return "", [], []
+
+    try:
+        data = json.loads(structured) if isinstance(structured, str) else structured
+    except (json.JSONDecodeError, TypeError):
+        return "", [], []
+
+    blocks_data = data.get("BlocksData", [])
+    tree_repr = data.get("TreeHierarchyRepresentation", {})
+    if not blocks_data:
+        return "", [], []
+
+    blocks_map = {b.get("Id"): b for b in blocks_data if b.get("Id")}
+    answer_parts: List[str] = []
+    thinking_steps: List[ThinkingStep] = []
+
+    def walk(block_id: str):
+        block = blocks_map.get(block_id)
+        if not block:
+            return
+        ct = block.get("ContentType", "")
+
+        if ct == "VerticalComposition":
+            for cid in block.get("CompositionInfo", {}).get("ChildIds", []):
+                walk(cid)
+            return
+
+        if ct == "ReasoningSummary":
+            rs = block.get("ReasoningSummary", {})
+            title = rs.get("Title")
+            content = rs.get("Content")
+            tool_title = rs.get("ToolTitle")
+            tool_type = rs.get("ToolType")
+
+            if tool_title and tool_type:
+                thinking_steps.append(ThinkingStep(kind="tool", title=tool_title, tool=tool_type))
+            elif title and not content:
+                thinking_steps.append(ThinkingStep(kind="reasoning_title", title=title))
+            elif content:
+                thinking_steps.append(ThinkingStep(kind="reasoning_content", content=content))
+            return
+
+        if ct == "Markdown":
+            md = block.get("Markdown", {})
+            text = (md.get("TargetMarkdownText") or "").strip()
+            if text:
+                answer_parts.append(text)
+            return
+
+    walk(tree_repr.get("Id", ""))
+
+    sources: List[Dict[str, Any]] = []
+    src_json = nsb.get("json_source_data")
+    if src_json:
+        try:
+            parsed = json.loads(src_json) if isinstance(src_json, str) else src_json
+            if isinstance(parsed, list):
+                sources = parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return "\n\n".join(answer_parts), thinking_steps, sources
+
+
 class GenericAppAgent(AliceAgent):
-    def __init__(
-        self,
-        app_id: str,
-        name: str,
-        aliases: Optional[List[str]] = None,
-        description: str = "",
-    ):
+    def __init__(self, app_id: str, name: str, aliases: Optional[List[str]] = None, description: str = ""):
         self.id = app_id
         self.name = name
         self.aliases = aliases or []
@@ -102,94 +164,19 @@ class GenericAppAgent(AliceAgent):
         self.preset = "dialogovo_alice_apps_sticky"
         self.app_id = app_id
         self.description = description
-        self.timeout = 60.0
-
-
-def parse_cookies_file(content: str) -> Tuple[str, Dict[str, str]]:
-    cookie_dict: Dict[str, str] = {}
-    lines = content.strip().splitlines()
-    is_netscape = any(l.startswith("# Netscape") or "\t" in l for l in lines)
-
-    if is_netscape:
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith("# HTTP") or line.startswith("# Netscape"):
-                continue
-            if line.startswith("#") and not line.startswith("#HttpOnly_"):
-                continue
-            if line.startswith("#HttpOnly_"):
-                line = line[len("#HttpOnly_"):]
-            parts = line.split("\t")
-            if len(parts) >= 7:
-                name = parts[5].strip()
-                val = parts[6].strip()
-                cookie_dict[name] = val
-    else:
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            for item in line.split(";"):
-                item = item.strip()
-                if "=" in item:
-                    k, v = item.split("=", 1)
-                    cookie_dict[k.strip()] = v.strip()
-
-    if "alice_uuid" not in cookie_dict:
-        if "yandexuid" in cookie_dict:
-            cookie_dict["alice_uuid"] = cookie_dict["yandexuid"].zfill(32)
-        else:
-            cookie_dict["alice_uuid"] = "00000000000008672953191788425249"
-
-    cookie_header = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
-    return cookie_header, cookie_dict
-
-
-def load_cookies(filepath: str) -> Tuple[str, Dict[str, str]]:
-    if os.path.exists(filepath):
-        with open(filepath, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-    else:
-        env_cookie = os.environ.get("ALICE_COOKIES")
-        if env_cookie:
-            content = env_cookie.strip()
-        else:
-            raise FileNotFoundError(f"Файл кук '{filepath}' не найден!")
-    return parse_cookies_file(content)
+        self.timeout = 300.0
 
 
 class AliceRpcClient:
-    def __init__(self, cookies: str, uuid_val: str, verbose: bool = False):
-        self.cookies = cookies
-        self.uuid = uuid_val
+    def __init__(self, credentials: AliceCredentials, verbose: bool = False):
+        self.creds = credentials
         self.verbose = verbose
-        self.headers = {
-            "User-Agent": USER_AGENT,
-            "Origin": ORIGIN,
-            "Referer": "https://alice.yandex.ru/",
-            "Cookie": self.cookies,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "x-ya-app-id": "ru.yandex.webstandalone.desktop",
-            "x-ya-app-type": "other",
-            "X-Ya-App-Id": "ru.yandex.webstandalone.desktop",
-            "X-Ya-App-Type": "other",
-            "X-Ya-Uuid": self.uuid,
-            "X-Ya-Device-Id": self.uuid,
-            "X-Ya-Language": "ru",
-            "X-Ya-Supported-Features": ",".join(DEFAULT_SUPPORTED_FEATURES),
-            "X-Ya-Application": json.dumps(
-                {
-                    "app_id": "ru.yandex.webstandalone.desktop",
-                    "app_type": "other",
-                    "uuid": self.uuid,
-                    "device_id": self.uuid,
-                    "lang": "ru",
-                    "timezone": "Europe/Moscow",
-                }
-            ),
-            "X-Ya-Experiments": json.dumps(DEFAULT_EXPERIMENTS),
-        }
+        self.headers = self.creds.build_rpc_headers()
+        if verbose:
+            total = sum(len(k) + len(v) + 4 for k, v in self.headers.items())
+            cookie_len = len(self.headers.get("Cookie", ""))
+            logger.info(f"RPC headers: total≈{total}B, Cookie≈{cookie_len}B, "
+                        f"cookies={len(self.creds.cookie_dict)} (sent={len(self.headers.get('Cookie', '').split(';'))})")
 
     async def get_alice_apps(self) -> Tuple[int, List[Dict[str, Any]], str]:
         url = f"{RPC_BASE_URL}/gproxy/get_alice_apps"
@@ -198,55 +185,43 @@ class AliceRpcClient:
                 async with session.post(url, json={}) as resp:
                     status = resp.status
                     body = await resp.text()
-                    if self.verbose:
-                        print(f"\033[34m[RPC]\033[0m POST /gproxy/get_alice_apps -> HTTP {status}")
                     if status == 200:
-                        data = json.loads(body)
-                        return status, data.get("apps", []), "OK"
+                        return status, json.loads(body).get("apps", []), "OK"
                     return status, [], body[:250]
             except Exception as e:
                 return 0, [], str(e)
 
-    async def list_dialogs(self, limit: int = 15) -> Tuple[int, List[Dict[str, Any]], str]:
+    async def list_dialogs(self, limit: int = 15, not_entrypoint: bool = False) -> Tuple[int, List[Dict[str, Any]], str]:
         url = f"{RPC_BASE_URL}/dialog/list"
         async with aiohttp.ClientSession(headers=self.headers) as session:
             try:
-                async with session.post(
-                    url, json={"limit": limit, "hints": {"not_entrypoint": False}}
-                ) as resp:
+                async with session.post(url, json={"limit": limit, "hints": {"not_entrypoint": not_entrypoint}}) as resp:
                     status = resp.status
                     body = await resp.text()
-                    if self.verbose:
-                        print(f"\033[34m[RPC]\033[0m POST /dialog/list -> HTTP {status}")
                     if status == 200:
-                        data = json.loads(body)
-                        return status, data.get("objects", []), "OK"
+                        objs = json.loads(body).get("objects", [])
+                        logger.warning(f"LIST-DIALOGS count={len(objs)} ids={[o.get('dialog',{}).get('dialog_id') for o in objs][:5]}")
+                        return status, objs, "OK"
                     return status, [], body[:250]
             except Exception as e:
                 return 0, [], str(e)
 
     async def delete_dialog(self, dialog_id: str) -> Tuple[int, str]:
-        """Точный метод удаления чата через /dialog/remove_dialog"""
         url = f"{RPC_BASE_URL}/dialog/remove_dialog"
         async with aiohttp.ClientSession(headers=self.headers) as session:
             try:
                 async with session.post(url, json={"dialog_id": dialog_id}) as resp:
-                    status = resp.status
-                    body = await resp.text()
-                    if self.verbose:
-                        print(f"\033[34m[RPC]\033[0m POST /dialog/remove_dialog ({dialog_id[:10]}...) -> HTTP {status}")
-                    return status, body[:250]
+                    return resp.status, await resp.text()
             except Exception as e:
                 return 0, str(e)
 
 
 class AliceWsEngine:
-    def __init__(self, cookies: str, uuid_val: str, icookie_val: str, verbose: bool = False):
-        self.cookies = cookies
-        self.uuid = uuid_val
-        self.icookie = icookie_val
+    def __init__(self, credentials: AliceCredentials, verbose: bool = False, show_thinking: bool = False):
+        self.creds = credentials
         self.verbose = verbose
-        self.ws: Optional[websockets.WebSocketClientProtocol] = None
+        self.show_thinking = show_thinking
+        self.ws: Optional[Any] = None
         self.seq_number = 0
         self.session_id: Optional[str] = None
         self.is_connected = False
@@ -255,17 +230,21 @@ class AliceWsEngine:
         self._active_agents_by_req: Dict[str, AliceAgent] = {}
         self._sync_event = asyncio.Event()
 
+        self._upload_pending: Dict[str, asyncio.Queue] = {}
+        self._upload_lock = asyncio.Lock()
+        self._send_lock = asyncio.Lock()
+        self._next_stream_id = 1
+
+        self._full_content_dialogs: Set[str] = set()
+        self._ping_dialogs: Set[str] = set()
+        self._meeseeks_dialogs: Set[str] = set()
+
+        self.expert_trial_left: Optional[int] = None
+        self.expert_trial_limit: Optional[int] = None
+
     async def connect(self):
-        headers = {
-            "User-Agent": USER_AGENT,
-            "Origin": ORIGIN,
-            "Cookie": self.cookies,
-            "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
-            "x-ya-app-id": "ru.yandex.webstandalone.desktop",
-            "x-ya-app-type": "other",
-            "X-Ya-Uuid": self.uuid,
-            "X-Ya-Device-Id": self.uuid,
-        }
+        headers = self.creds.build_ws_headers()
+
         sig = inspect.signature(websockets.connect)
         ws_kwargs: Dict[str, Any] = {"ping_interval": None}
         if "max_size" in sig.parameters:
@@ -286,89 +265,218 @@ class AliceWsEngine:
         try:
             await asyncio.wait_for(self._sync_event.wait(), timeout=7.0)
             if self.verbose:
-                print(f"\033[32m[WS SYNC]\033[0m Сессия Uniproxy готова: {self.session_id}")
+                logger.info(f"Сессия Uniproxy: {self.session_id}")
         except asyncio.TimeoutError:
-            logger.warning("Таймаут ожидания SynchronizeStateResponse, продолжаем...")
+            logger.warning("Таймаут SynchronizeStateResponse")
 
     async def disconnect(self):
         self.is_connected = False
         if self._running_task:
             self._running_task.cancel()
         if self.ws:
-            await self.ws.close()
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
 
     async def _send_json(self, data: dict):
-        if not self.ws or not self.is_connected:
-            raise ConnectionError("WebSocket не подключен")
-        self.seq_number += 1
-        if "event" in data and "header" in data["event"]:
-            data["event"]["header"]["seqNumber"] = self.seq_number
-        await self.ws.send(json.dumps(data, ensure_ascii=False))
+        async with self._send_lock:
+            if not self.ws or not self.is_connected:
+                raise ConnectionError("WebSocket не подключен")
+            self.seq_number += 1
+            if "event" in data and "header" in data["event"]:
+                data["event"]["header"]["seqNumber"] = self.seq_number
+            await self.ws.send(json.dumps(data, ensure_ascii=False))
 
     async def _synchronize_state(self):
         msg_id = str(uuid.uuid4())
         payload = {
             "event": {
                 "header": {
-                    "namespace": "System",
-                    "name": "SynchronizeState",
-                    "seqNumber": 1,
-                    "messageId": msg_id,
+                    "namespace": "System", "name": "SynchronizeState",
+                    "seqNumber": 1, "messageId": msg_id,
                 },
                 "payload": {
-                    "auth_token": str(uuid.uuid4()),
-                    "uuid": self.uuid,
+                    "auth_token": self.creds.get_ws_auth_token(),
+                    "uuid": self.creds.device_uuid,
                     "vins": {
                         "application": {
                             "app_id": "ru.yandex.webstandalone.desktop",
                             "platform": "linux",
-                            "device_id": self.uuid,
-                            "uuid": self.uuid,
+                            "device_id": self.creds.device_uuid,
+                            "uuid": self.creds.device_uuid,
                         }
                     },
                     "supported_features": DEFAULT_SUPPORTED_FEATURES,
                     "request": {"experiments": DEFAULT_EXPERIMENTS},
                     "speechkitVersion": "4.16.7",
-                    "icookie": self.icookie,
+                    "icookie": self.creds.icookie,
                     "client_analytics_info": {"client_url": "https://alice.yandex.ru/chat/"},
                 },
             }
         }
+        logger.warning(
+            f"DIALOG-OUT dialog_id={dialog_id} "
+            f"dialog_type={header_dict.get('dialog_type')} "
+            f"preset={agent.preset} mode={agent.mode} "
+            f"app_id={payload['event']['payload']['application']['app_id']}"
+        )
         await self._send_json(payload)
 
-    async def update_subscriptions(self, active_dialog_id: str, other_dialog_ids: Set[str]):
-        subs = [{"id": did, "state": {"ping": {}}} for did in other_dialog_ids if did != active_dialog_id]
-        subs.append({"id": active_dialog_id, "state": {"full_content": {}}})
+    async def _flush_subscriptions(self):
+        if not self.is_connected:
+            return
+        subs: List[Dict[str, Any]] = []
+        for did in self._full_content_dialogs:
+            subs.append({"id": did, "state": {"full_content": {}}})
+        for did in self._ping_dialogs:
+            if did in self._full_content_dialogs:
+                continue
+            subs.append({"id": did, "state": {"ping": {}}})
+        if not subs:
+            return
         payload = {
             "event": {
-                "header": {
-                    "namespace": "System",
-                    "name": "ClientSubscriptionState",
-                    "messageId": str(uuid.uuid4()),
-                },
+                "header": {"namespace": "System", "name": "ClientSubscriptionState",
+                           "messageId": str(uuid.uuid4())},
                 "payload": {"subscriptions": subs},
             }
         }
-        await self._send_json(payload)
+        try:
+            await self._send_json(payload)
+        except Exception as e:
+            logger.debug(f"_flush_subscriptions: {e}")
+
+    async def update_subscriptions(self, active_dialog_id: str, other_dialog_ids: Set[str]):
+        self._full_content_dialogs = {active_dialog_id} | self._meeseeks_dialogs
+        self._ping_dialogs = other_dialog_ids - self._full_content_dialogs
+        await self._flush_subscriptions()
+
+    async def add_full_content(self, dialog_id: str):
+        self._meeseeks_dialogs.add(dialog_id)
+        self._full_content_dialogs.add(dialog_id)
+        self._ping_dialogs.discard(dialog_id)
+        await self._flush_subscriptions()
+
+    async def remove_full_content(self, dialog_id: str):
+        self._meeseeks_dialogs.discard(dialog_id)
+        self._full_content_dialogs.discard(dialog_id)
+        await self._flush_subscriptions()
+
+    async def upload_file(
+        self, file_path: str, title: Optional[str] = None,
+        mime_type: Optional[str] = None, origin: str = "Chat", timeout: float = 120.0,
+    ) -> Optional[Dict[str, Any]]:
+        path = os.path.expanduser(file_path)
+        if not os.path.isfile(path):
+            logger.warning(f"upload_file: нет файла: {path}")
+            return None
+        size = os.path.getsize(path)
+        if size == 0:
+            return None
+
+        title = title or os.path.basename(path)
+        if not mime_type:
+            guessed, _ = mimetypes.guess_type(path)
+            mime_type = guessed or "application/octet-stream"
+
+        async with self._upload_lock:
+            stream_id = self._next_stream_id
+            self._next_stream_id += 1
+            message_id = str(uuid.uuid4())
+            queue: asyncio.Queue = asyncio.Queue()
+            self._upload_pending[message_id] = queue
+
+            try:
+                await self._send_json({
+                    "event": {
+                        "header": {"namespace": "File", "name": "Upload",
+                                   "streamId": stream_id, "messageId": message_id},
+                        "payload": {"file_upload_start": {
+                            "mime_type": mime_type, "size": size,
+                            "title": title, "origin": origin,
+                        }},
+                    }
+                })
+
+                try:
+                    ack = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    return None
+
+                start = ack.get("file_upload_start") or {}
+                chunk_size = int(start.get("max_chunk_size") or 10 * 1024 * 1024)
+                chunk_size = max(512 * 1024, min(chunk_size, 16 * 1024 * 1024))
+
+                async with self._send_lock:
+                    if not self.ws:
+                        raise ConnectionError("WS закрыт")
+                    with open(path, "rb") as f:
+                        while True:
+                            chunk = f.read(chunk_size)
+                            if not chunk:
+                                break
+                            if not self.ws or not self.is_connected:
+                                raise ConnectionError("WS закрыт")
+                            await self.ws.send(chunk)
+
+                await self._send_json({
+                    "event": {
+                        "header": {"namespace": "File", "name": "Upload",
+                                   "streamId": stream_id, "messageId": str(uuid.uuid4()),
+                                   "refMessageId": message_id},
+                        "payload": {"chunk_upload_finish": {"is_last": True}},
+                    }
+                })
+
+                deadline = asyncio.get_event_loop().time() + timeout
+                finish: Dict[str, Any] = {}
+                while True:
+                    remaining = deadline - asyncio.get_event_loop().time()
+                    if remaining <= 0:
+                        return None
+                    try:
+                        msg = await asyncio.wait_for(queue.get(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        return None
+                    fp = msg.get("file_upload_finish")
+                    if fp:
+                        finish = fp
+                        break
+
+                file_guid = finish.get("file_guid")
+                if not file_guid:
+                    return None
+
+                try:
+                    if self.ws and self.is_connected:
+                        await self.ws.send(json.dumps({
+                            "streamcontrol": {"action": 0, "reason": 0,
+                                              "streamId": stream_id, "messageId": message_id}
+                        }, ensure_ascii=False))
+                except Exception:
+                    pass
+
+                return {
+                    "file_guid": file_guid,
+                    "title": finish.get("title") or title,
+                    "mime_type": finish.get("mime_type") or mime_type,
+                    "size_bytes": finish.get("size_bytes") or size,
+                    "preview_url": finish.get("preview_url"),
+                    "extension": finish.get("extension"),
+                }
+            finally:
+                self._upload_pending.pop(message_id, None)
 
     async def send_text_input(
-        self,
-        text: str,
-        dialog_id: str,
-        agent: AliceAgent,
-        prev_req_id: Optional[str] = None,
-        is_suggest: bool = False,
+        self, text: str, dialog_id: str, agent: AliceAgent,
+        prev_req_id: Optional[str] = None, is_suggest: bool = False,
+        attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> AsyncGenerator[AliceTurnResponse, None]:
         req_id = str(uuid.uuid4())
-        client_time = datetime.now().strftime("%Y%m%dT%H%M%S")
-        timestamp = str(int(time.time()))
-
-        capabilities = agent.build_capabilities(dialog_id, self.uuid)
-
+        capabilities = agent.build_capabilities(dialog_id, self.creds.device_uuid)
         header_dict: Dict[str, Any] = {
-            "request_id": req_id,
-            "dialog_id": dialog_id,
-            "dialog_type": 2,
+            "request_id": req_id, "dialog_id": dialog_id, "dialog_type": 0, # "dialog_type": 1,
         }
         if prev_req_id:
             header_dict["prev_req_id"] = prev_req_id
@@ -377,39 +485,40 @@ class AliceWsEngine:
 
         payload = {
             "event": {
-                "header": {
-                    "namespace": "Vins",
-                    "name": "TextInput",
-                    "messageId": req_id,
-                    "seqNumber": self.seq_number + 1,
-                },
+                "header": {"namespace": "Vins", "name": "TextInput",
+                           "messageId": req_id, "seqNumber": self.seq_number + 1},
                 "payload": {
                     "application": {
                         "app_id": "ru.yandex.webstandalone.desktop",
-                        "app_version": "unknown",
-                        "platform": "linux",
+                        "app_version": "unknown", "platform": "linux",
                         "os_version": USER_AGENT.lower(),
-                        "uuid": self.uuid,
-                        "device_id": self.uuid,
+                        "uuid": self.creds.device_uuid,
+                        "device_id": self.creds.device_uuid,
                         "lang": "ru-RU",
-                        "client_time": client_time,
+                        "client_time": datetime.now().strftime("%Y%m%dT%H%M%S"),
                         "timezone": "Europe/Moscow",
-                        "timestamp": timestamp,
+                        "timestamp": str(int(time.time())),
                     },
                     "header": header_dict,
                     "request": {
                         "event": {"type": event_type, "text": text},
                         "voice_session": False,
                         "experiments": DEFAULT_EXPERIMENTS,
-                        "uniproxy_options": {"background_response_streaming_options": {}},
+                        "uniproxy_options": {
+                            "background_response_streaming_options": {
+                                "request_with_shown_new_dialog": {}
+                            }
+                        },
                         "additional_options": {
                             "bass_options": {"user_agent": USER_AGENT, "screen_scale_factor": 1},
                             "origin_domain": "yandex.ru",
                             "supported_features": DEFAULT_SUPPORTED_FEATURES,
                             "unsupported_features": [],
-                            "icookie": self.icookie,
+                            "icookie": self.creds.icookie,
                         },
-                        "environment_state": {"endpoints": [{"id": self.uuid, "capabilities": capabilities}]},
+                        "environment_state": {"endpoints": [
+                            {"id": self.creds.device_uuid, "capabilities": capabilities}
+                        ]},
                     },
                     "format": "audio/ogg;codecs=opus",
                     "mime": "audio/ogg;codecs=opus",
@@ -420,11 +529,8 @@ class AliceWsEngine:
             }
         }
 
-        if self.verbose:
-            print(f"\033[36m[WS SEND]\033[0m TextInput (seq={self.seq_number + 1}) | "
-                  f"dialog: \033[1m{dialog_id[:10]}...\033[0m | "
-                  f"agent: \033[33m{agent.id}\033[0m ({agent.name}) | "
-                  f"text: \"{text[:45]}{'...' if len(text) > 45 else ''}\"")
+        if attachments:
+            payload["event"]["payload"]["request"]["attachments"] = attachments
 
         queue: asyncio.Queue = asyncio.Queue()
         self._pending_responses[req_id] = queue
@@ -440,20 +546,30 @@ class AliceWsEngine:
                     break
         except asyncio.TimeoutError:
             yield AliceTurnResponse(
-                dialog_id=dialog_id,
-                request_id=req_id,
-                is_finished=True,
-                error=f"Таймаут ответа Uniproxy ({agent.timeout} сек).",
+                dialog_id=dialog_id, request_id=req_id,
+                is_finished=True, error=f"Таймаут ответа ({agent.timeout} с).",
             )
         finally:
             self._pending_responses.pop(req_id, None)
             self._active_agents_by_req.pop(req_id, None)
+
+    def _update_trial_state(self, payload: Dict[str, Any]):
+        eff = payload.get("alice_2_effective_settings") or {}
+        trial = eff.get("trial_state") or {}
+        left = trial.get("left_count")
+        limit = trial.get("limit")
+        if left is not None:
+            self.expert_trial_left = int(left)
+            self.expert_trial_limit = int(limit) if limit is not None else self.expert_trial_limit
 
     async def _listen_loop(self):
         accumulated_turns: Dict[str, AliceTurnResponse] = {}
 
         while self.is_connected:
             try:
+                if not self.ws:
+                    logger.warning("ws is None, break listener")
+                    break
                 raw_msg = await self.ws.recv()
                 if not raw_msg:
                     continue
@@ -465,17 +581,11 @@ class AliceWsEngine:
                 ref_id = header.get("refMessageId") or header.get("ref_message_id")
 
                 if name == "Ping":
-                    pong = {
-                        "event": {
-                            "header": {
-                                "namespace": "System",
-                                "name": "Pong",
-                                "messageId": str(uuid.uuid4()),
-                                "refMessageId": header.get("messageId"),
-                            },
-                            "payload": {},
-                        }
-                    }
+                    pong = {"event": {"header": {
+                        "namespace": "System", "name": "Pong",
+                        "messageId": str(uuid.uuid4()),
+                        "refMessageId": header.get("messageId"),
+                    }, "payload": {}}}
                     await self._send_json(pong)
                     continue
 
@@ -485,21 +595,19 @@ class AliceWsEngine:
                     continue
 
                 if name == "VinsResponse":
-                    d_payload = directive.get("payload", {})
-                    qs = d_payload.get("response", {}).get("quality_storage", {})
-                    win_reason = qs.get("post_win_reason", "unknown")
-                    predicts = qs.get("post_predicts", {})
-                    eff_settings = d_payload.get("effective_alice_2_settings", {})
+                    payload = directive.get("payload", {})
+                    if "alice_2_effective_settings" in payload:
+                        self._update_trial_state(payload)
+                    continue
 
-                    winner = list(predicts.keys())[0] if predicts else "Standard"
-                    if self.verbose:
-                        print(f"\033[32m[WS RECV]\033[0m VinsResponse | winner: \033[1m{winner}\033[0m ({win_reason}) | "
-                              f"effective: {eff_settings.get('preset', 'none')}")
+                if name == "Upload" and ref_id in self._upload_pending:
+                    await self._upload_pending[ref_id].put(directive.get("payload", {}))
                     continue
 
                 if name in ("ErrorMessage", "Error") and ref_id in self._pending_responses:
                     err_text = directive.get("payload", {}).get("message", "Ошибка Uniproxy")
-                    turn = AliceTurnResponse(dialog_id="", request_id=ref_id, is_finished=True, error=err_text)
+                    turn = AliceTurnResponse(dialog_id="", request_id=ref_id,
+                                            is_finished=True, error=err_text)
                     await self._pending_responses[ref_id].put(turn)
                     continue
 
@@ -508,7 +616,6 @@ class AliceWsEngine:
                     json_resp = payload.get("json_response", {})
                     base_resp = json_resp.get("base_response", {})
                     is_last = json_resp.get("is_last", False)
-                    partial_num = json_resp.get("response_partial_num", 0)
                     cards = base_resp.get("cards", [])
 
                     if ref_id not in accumulated_turns:
@@ -516,46 +623,53 @@ class AliceWsEngine:
 
                     turn = accumulated_turns[ref_id]
                     turn.is_finished = is_last
-
-                    # Свежий список для каждого чанка полностью исключает дубликаты виджетов и текста
                     text_blocks: List[str] = []
                     turn.widgets = []
 
                     agent = self._active_agents_by_req.get(ref_id) or registry.get("pro")
 
                     for card in cards:
-                        handled = agent.parse_card(card, turn, text_blocks)
-                        if not handled:
-                            tc = card.get("text_card")
-                            if tc and "text" in tc:
-                                t = tc["text"].strip()
-                                if t and t not in text_blocks:
-                                    text_blocks.append(t)
+                        # 1. Пробуем структурированный парсер
+                        answer_text, thinking_steps, sources = _parse_nsb_card(card)
+                        if thinking_steps:
+                            turn.thinking_steps = thinking_steps
+                        if sources:
+                            turn.sources = sources
+                        if answer_text and answer_text not in text_blocks:
+                            text_blocks.append(answer_text)
 
-                            nsb = card.get("neuro_structured_blocks_card")
-                            if nsb and "plain_text" in nsb:
-                                pt = nsb["plain_text"].strip()
-                                if pt and pt not in text_blocks:
-                                    text_blocks.append(pt)
+                        if answer_text or thinking_steps:
+                            continue
+
+                        # 2. Специфичный агент
+                        handled = agent.parse_card(card, turn, text_blocks)
+                        if handled:
+                            continue
+
+                        # 3. Fallback: text_card
+                        tc = card.get("text_card")
+                        if tc and "text" in tc:
+                            t = tc["text"].strip()
+                            if t and t not in text_blocks:
+                                text_blocks.append(t)
+
+                        # 4. Fallback: plain_text ТОЛЬКО если нет structured
+                        nsb = card.get("neuro_structured_blocks_card")
+                        if nsb and not nsb.get("json_structured_data"):
+                            pt = (nsb.get("plain_text") or "").strip()
+                            if pt and pt not in text_blocks:
+                                text_blocks.append(pt)
 
                     turn.text = "\n\n".join(text_blocks)
-
-                    if self.verbose:
-                        card_types = [
-                            c.get("rich_uicard", {}).get("uicomponent_name") or list(c.keys())[0]
-                            for c in cards
-                        ]
-                        if card_types:
-                            print(f"\033[35m[WS RECV]\033[0m DeferredAliceResponse #{partial_num}"
-                                  f"{' [LAST]' if is_last else ''} | cards: {card_types}")
-
                     turn_copy = AliceTurnResponse(
                         dialog_id=turn.dialog_id,
                         request_id=turn.request_id,
                         thinking_logs=list(turn.thinking_logs),
+                        thinking_steps=list(turn.thinking_steps),
                         text=turn.text,
                         widgets=list(turn.widgets),
                         suggestions=list(turn.suggestions),
+                        sources=list(turn.sources),
                         is_finished=turn.is_finished,
                         error=turn.error,
                     )
@@ -573,20 +687,16 @@ class AliceWsEngine:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Listener error: {e}")
+                logger.error(f"WS listener error: {e}")
 
 
 class AliceAgentManager:
-    def __init__(self, cookies: str, cookie_dict: Dict[str, str], verbose: bool = False):
-        self.cookies = cookies
-        self.cookie_dict = cookie_dict
+    def __init__(self, credentials: AliceCredentials, verbose: bool = False, show_thinking: bool = False):
+        self.creds = credentials
         self.verbose = verbose
-
-        self.uuid = cookie_dict.get("alice_uuid", "00000000000008672953191788425249")
-        self.icookie = cookie_dict.get("i", "")
-
-        self.rpc = AliceRpcClient(self.cookies, self.uuid, verbose=self.verbose)
-        self.ws = AliceWsEngine(self.cookies, self.uuid, self.icookie, verbose=self.verbose)
+        self.show_thinking = show_thinking
+        self.rpc = AliceRpcClient(self.creds, verbose=self.verbose)
+        self.ws = AliceWsEngine(self.creds, verbose=self.verbose, show_thinking=show_thinking)
 
         self.active_dialog_id: Optional[str] = None
         self.active_agent_id: str = "pro"
@@ -595,7 +705,7 @@ class AliceAgentManager:
         self.ephemeral_dialogs: Set[str] = set()
 
     async def initialize(self):
-        status, apps, err = await self.rpc.get_alice_apps()
+        status, apps, _ = await self.rpc.get_alice_apps()
         if status == 200:
             for app in apps:
                 app_id_val = app.get("app_id")
@@ -603,61 +713,54 @@ class AliceAgentManager:
                 if app_id_val:
                     existing = registry.get(app_id_val)
                     if not existing or existing.id == "pro":
-                        dyn_app = GenericAppAgent(
+                        registry.register(GenericAppAgent(
                             app_id=app_id_val,
                             name=app_name_val or "Приложение",
                             aliases=[app_name_val.lower()] if app_name_val else [],
                             description=app.get("description", ""),
-                        )
-                        registry.register(dyn_app)
+                        ))
 
         await self.ws.connect()
-
-        d_status, recent_dialogs, _ = await self.rpc.list_dialogs(limit=5)
+        _, recent_dialogs, _ = await self.rpc.list_dialogs(limit=5)
         for d in recent_dialogs:
             did = d.get("dialog", {}).get("dialog_id")
             if did:
                 self.known_dialogs.add(did)
                 if not self.active_dialog_id:
                     self.active_dialog_id = did
+        
+        status, dialogs, _ = await self.rpc.list_dialogs(limit=10)
+        logger.info(f"dialog/list: status={status}, count={len(dialogs)}")
 
         if not self.active_dialog_id:
-            self.active_dialog_id = str(uuid.uuid4())
+            self.active_dialog_id = uuid7()
             self.known_dialogs.add(self.active_dialog_id)
 
         await self.ws.update_subscriptions(self.active_dialog_id, self.known_dialogs)
 
     async def create_new_dialog(self, agent_id: Optional[str] = None, is_ephemeral: bool = False) -> str:
         agent = registry.get(agent_id or self.active_agent_id)
-        new_id = str(uuid.uuid4())
+        new_id = uuid7()
         self.known_dialogs.add(new_id)
         self.active_dialog_id = new_id
         self.active_agent_id = agent.id
         self.dialog_prev_req_ids[new_id] = None
-
         if is_ephemeral:
             self.ephemeral_dialogs.add(new_id)
-
         await self.ws.update_subscriptions(new_id, self.known_dialogs)
         return new_id
 
     async def cleanup_ephemeral_dialogs(self):
-        """Удаляет с серверов Яндекса все временные диалоги текущей сессии."""
         if not self.ephemeral_dialogs:
             return
         for did in list(self.ephemeral_dialogs):
-            status, _ = await self.rpc.delete_dialog(did)
-            if status == 200 and self.verbose:
-                print(f"\033[33m✓ Временный диалог {did[:10]}... удален с сервера.\033[0m")
+            await self.rpc.delete_dialog(did)
             self.known_dialogs.discard(did)
             self.ephemeral_dialogs.discard(did)
 
     async def send_message(
-        self,
-        text: str,
-        agent_id: Optional[str] = None,
-        dialog_id: Optional[str] = None,
-        is_suggest: bool = False,
+        self, text: str, agent_id: Optional[str] = None, dialog_id: Optional[str] = None,
+        is_suggest: bool = False, attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> AsyncGenerator[AliceTurnResponse, None]:
         agent = registry.get(agent_id or self.active_agent_id)
         target_dialog_id = dialog_id or self.active_dialog_id or await self.create_new_dialog(agent.id)
@@ -667,14 +770,11 @@ class AliceAgentManager:
         self.known_dialogs.add(target_dialog_id)
 
         prev_req_id = self.dialog_prev_req_ids.get(target_dialog_id)
-
         last_turn: Optional[AliceTurnResponse] = None
+
         async for turn in self.ws.send_text_input(
-            text=text,
-            dialog_id=target_dialog_id,
-            agent=agent,
-            prev_req_id=prev_req_id,
-            is_suggest=is_suggest,
+            text=text, dialog_id=target_dialog_id, agent=agent,
+            prev_req_id=prev_req_id, is_suggest=is_suggest, attachments=attachments,
         ):
             turn.dialog_id = target_dialog_id
             last_turn = turn
@@ -689,94 +789,80 @@ class AliceAgentManager:
 
 
 class AliceMcpServer:
-    def __init__(self, manager: AliceAgentManager):
+    def __init__(self, manager: Optional[AliceAgentManager] = None):
         self.manager = manager
+        self._managers_cache: Dict[str, AliceAgentManager] = {}
 
     def _get_tools_definition(self) -> List[Dict[str, Any]]:
-        agents_list = [f"'{a.id}' ({a.name})" for a in registry.list_all()]
-        agents_str = ", ".join(agents_list)
-        return [
-            {
-                "name": "alice_list_agents",
-                "description": "Возвращает каталог всех доступных агентов, моделей и приложений Алисы",
-                "inputSchema": {"type": "object", "properties": {}, "required": []},
-            },
-            {
-                "name": "alice_chat",
-                "description": f"Отправить запрос Алисе. Доступные агенты: {agents_str}",
+        tools = []
+        for a in registry.list_all():
+            tools.append({
+                "name": f"alice_ask_{a.id}",
+                "description": f"Сервис '{a.name}'. {a.description}",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "message": {"type": "string", "description": "Текст сообщения"},
-                        "agent": {
-                            "type": "string",
-                            "description": "Идентификатор агента: taxi, lavka, market, gas, legal, best_price, deep_research, pro, base",
-                            "default": "pro",
-                        },
-                        "dialog_id": {"type": "string", "description": "ID диалога (опционально)"},
+                        "message": {"type": "string"},
+                        "dialog_id": {"type": "string"},
+                        "auth": {"type": "string"},
                     },
                     "required": ["message"],
                 },
-            },
-            {
-                "name": "alice_click_action",
-                "description": "Выбрать подсказку, адрес или нажать кнопку действия",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "action_text": {"type": "string", "description": "Адрес, название тарифа или действие"},
-                        "dialog_id": {"type": "string", "description": "ID диалога (опционально)"},
-                    },
-                    "required": ["action_text"],
+            })
+        tools.append({
+            "name": "alice_click_action",
+            "description": "Выбрать вариант ответа, кнопку, адрес или тариф",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action_text": {"type": "string"},
+                    "dialog_id": {"type": "string"},
+                    "auth": {"type": "string"},
                 },
+                "required": ["action_text"],
             },
-            {
-                "name": "alice_new_chat",
-                "description": "Открыть новый диалог для приложения или агента",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "agent": {"type": "string", "description": "Агент для нового чата", "default": "pro"},
-                        "ephemeral": {"type": "boolean", "description": "Удалить диалог после закрытия", "default": False},
-                    },
-                    "required": [],
-                },
-            },
-        ]
+        })
+        return tools
+
+    async def _get_manager_for_call(self, auth_param: Optional[str]) -> Tuple[Optional[AliceAgentManager], Optional[str]]:
+        if auth_param:
+            if auth_param in self._managers_cache:
+                return self._managers_cache[auth_param], None
+            creds = resolve_auth_source(auth_param)
+            if not creds:
+                return None, f"Не удалось распарсить токен: {auth_param[:20]}..."
+            ok, msg = await verify_credentials(creds)
+            if not ok:
+                return None, f"Ошибка авторизации: {msg}"
+            mgr = AliceAgentManager(creds, verbose=False)
+            await mgr.initialize()
+            self._managers_cache[auth_param] = mgr
+            return mgr, None
+        if self.manager:
+            return self.manager, None
+        return None, "Авторизация не настроена."
 
     async def handle_tool_call(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        if tool_name == "alice_list_agents":
-            agents_data = [
-                {
-                    "id": a.id,
-                    "name": a.name,
-                    "type": a.type,
-                    "mode": a.mode,
-                    "aliases": a.aliases,
-                    "description": a.description,
-                }
-                for a in registry.list_all()
-            ]
-            return {"content": [{"type": "text", "text": json.dumps(agents_data, ensure_ascii=False, indent=2)}]}
+        mgr, err = await self._get_manager_for_call(arguments.get("auth"))
+        if err or not mgr:
+            return {"isError": True, "content": [{"type": "text", "text": f"[Ошибка]: {err}"}]}
 
-        elif tool_name == "alice_chat":
+        if tool_name.startswith("alice_ask_"):
+            agent_id = tool_name[len("alice_ask_"):]
             msg = arguments.get("message", "")
-            agent = arguments.get("agent", "pro")
             did = arguments.get("dialog_id")
-
             final_turn = None
-            async for turn in self.manager.send_message(msg, agent_id=agent, dialog_id=did):
+            async for turn in mgr.send_message(msg, agent_id=agent_id, dialog_id=did):
                 final_turn = turn
-
             if not final_turn:
-                return {"isError": True, "content": [{"type": "text", "text": "Не получен ответ от Алисы"}]}
+                return {"isError": True, "content": [{"type": "text", "text": "Нет ответа"}]}
             if final_turn.error:
                 return {"isError": True, "content": [{"type": "text", "text": f"Ошибка: {final_turn.error}"}]}
-
             result_obj = {
                 "dialog_id": final_turn.dialog_id,
                 "text": final_turn.text,
-                "thinking_steps": final_turn.thinking_logs,
+                "thinking_steps": [s.to_dict() for s in final_turn.thinking_steps],
+                "sources": final_turn.sources,
                 "widgets": [w.to_dict() for w in final_turn.widgets],
                 "suggested_actions": [s.to_dict() for s in final_turn.suggestions],
             }
@@ -784,15 +870,12 @@ class AliceMcpServer:
 
         elif tool_name == "alice_click_action":
             action_text = arguments.get("action_text", "")
-            did = arguments.get("dialog_id") or self.manager.active_dialog_id
-
+            did = arguments.get("dialog_id")
             final_turn = None
-            async for turn in self.manager.send_message(action_text, dialog_id=did, is_suggest=True):
+            async for turn in mgr.send_message(action_text, dialog_id=did, is_suggest=True):
                 final_turn = turn
-
             if not final_turn or final_turn.error:
                 return {"isError": True, "content": [{"type": "text", "text": final_turn.error if final_turn else "Ошибка"}]}
-
             result_obj = {
                 "dialog_id": final_turn.dialog_id,
                 "text": final_turn.text,
@@ -800,12 +883,6 @@ class AliceMcpServer:
                 "suggested_actions": [s.to_dict() for s in final_turn.suggestions],
             }
             return {"content": [{"type": "text", "text": json.dumps(result_obj, ensure_ascii=False, indent=2)}]}
-
-        elif tool_name == "alice_new_chat":
-            ag = arguments.get("agent", "pro")
-            eph = arguments.get("ephemeral", False)
-            new_id = await self.manager.create_new_dialog(agent_id=ag, is_ephemeral=eph)
-            return {"content": [{"type": "text", "text": f"Создан диалог ID: {new_id} [агент: {ag}, ephemeral: {eph}]"}]}
 
         return {"isError": True, "content": [{"type": "text", "text": f"Неизвестный инструмент: {tool_name}"}]}
 
@@ -826,224 +903,131 @@ class AliceMcpServer:
             line_str = line.decode("utf-8").strip()
             if not line_str:
                 continue
-
             try:
                 req = json.loads(line_str)
                 req_id = req.get("id")
                 method = req.get("method")
                 params = req.get("params", {})
-
                 if method == "initialize":
-                    res = {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": {
-                            "protocolVersion": "2024-11-05",
-                            "capabilities": {"tools": {}},
-                            "serverInfo": {"name": "yandex-alice-agents-server", "version": "3.3.0"},
-                        },
-                    }
+                    res = {"jsonrpc": "2.0", "id": req_id, "result": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "yandex-alice-server", "version": "4.5.0"},
+                    }}
                 elif method == "notifications/initialized":
                     continue
+                elif method == "tools/list":
+                    res = {"jsonrpc": "2.0", "id": req_id, "result": {"tools": self._get_tools_definition()}}
+                elif method == "tools/call":
+                    call_result = await self.handle_tool_call(params.get("name"), params.get("arguments", {}))
+                    res = {"jsonrpc": "2.0", "id": req_id, "result": call_result}
                 elif method == "ping":
                     res = {"jsonrpc": "2.0", "id": req_id, "result": {}}
-                elif method == "tools/list":
-                    res = {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": {"tools": self._get_tools_definition()},
-                    }
-                elif method == "tools/call":
-                    tool_name = params.get("name")
-                    arguments = params.get("arguments", {})
-                    call_result = await self.handle_tool_call(tool_name, arguments)
-                    res = {"jsonrpc": "2.0", "id": req_id, "result": call_result}
                 else:
-                    res = {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "error": {"code": -32601, "message": f"Method not found: {method}"},
-                    }
-
+                    res = {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": "Method not found"}}
                 writer.write((json.dumps(res, ensure_ascii=False) + "\n").encode("utf-8"))
                 await writer.drain()
-
             except Exception as e:
                 err = {"jsonrpc": "2.0", "id": None, "error": {"code": -32603, "message": str(e)}}
                 writer.write((json.dumps(err) + "\n").encode("utf-8"))
                 await writer.drain()
 
 
-def create_curl_http_app(manager: AliceAgentManager):
+def create_curl_http_app(manager: Optional[AliceAgentManager]):
     from fastapi import FastAPI, Request
-    from fastapi.responses import PlainTextResponse, StreamingResponse
+    from fastapi.responses import PlainTextResponse
 
-    app = FastAPI(title="Alice curl Terminal API", docs_url=None, redoc_url=None)
-
-    @app.get("/agents")
-    def get_agents_curl():
-        lines = [f"{'ID':<14} {'ТИП':<8} {'ИМЯ':<30} {'ОПИСАНИЕ':<35}", "-" * 85]
-        for a in registry.list_all():
-            lines.append(f"{a.id:<14} [{a.type.upper():<5}] {a.name:<30} {a.description}")
-        return PlainTextResponse("\n".join(lines) + "\n")
-
-    @app.get("/dialogs")
-    def get_dialogs_curl():
-        lines = [f"Active Dialog ID: {manager.active_dialog_id} (Agent: {manager.active_agent_id})", "Known Dialogs:"]
-        for did in manager.known_dialogs:
-            marker = " <-- ACTIVE" if did == manager.active_dialog_id else ""
-            eph_marker = " [EPHEMERAL]" if did in manager.ephemeral_dialogs else ""
-            lines.append(f"  - {did}{eph_marker}{marker}")
-        return PlainTextResponse("\n".join(lines) + "\n")
-
-    @app.post("/dialogs/new")
-    async def create_new_dialog_curl(request: Request):
-        agent = request.query_params.get("agent", "pro")
-        eph = request.query_params.get("ephemeral", "0") in ("1", "true")
-        new_id = await manager.create_new_dialog(agent_id=agent, is_ephemeral=eph)
-        return PlainTextResponse(f"Created new active dialog: {new_id} [agent: {agent}, ephemeral: {eph}]\n")
-
-    @app.delete("/dialogs/{dialog_id}")
-    async def delete_dialog_curl(dialog_id: str):
-        status, resp = await manager.rpc.delete_dialog(dialog_id)
-        manager.known_dialogs.discard(dialog_id)
-        manager.ephemeral_dialogs.discard(dialog_id)
-        return PlainTextResponse(f"Deleted dialog {dialog_id}: HTTP {status}\n")
+    app = FastAPI(title="Alice HTTP API")
 
     @app.post("/chat")
-    async def chat_curl_post(request: Request):
-        agent = request.query_params.get("agent", manager.active_agent_id)
-        dialog_id = request.query_params.get("dialog_id")
-        stream_param = request.query_params.get("stream")
-        stream_mode = True if stream_param is None else stream_param in ("1", "true")
-        is_ephemeral = request.query_params.get("ephemeral", "0") in ("1", "true")
+    async def chat_post(request: Request):
+        text = (await request.body()).decode("utf-8").strip()
+        auth_header = request.headers.get("Authorization") or request.headers.get("X-Alice-Auth")
 
-        raw_body = await request.body()
-        text = raw_body.decode("utf-8").strip()
+        mgr = manager
+        if auth_header:
+            custom_creds = resolve_auth_source(auth_header)
+            if custom_creds:
+                ok, msg = await verify_credentials(custom_creds)
+                if not ok:
+                    return PlainTextResponse(f"Auth Error: {msg}\n", status_code=401)
+                mgr = AliceAgentManager(custom_creds, verbose=False)
+                await mgr.initialize()
 
-        is_suggest = False
-        if text.startswith("{") and text.endswith("}"):
-            try:
-                jb = json.loads(text)
-                text = jb.get("message") or jb.get("text", text)
-                agent = jb.get("agent", agent)
-                dialog_id = jb.get("dialog_id", dialog_id)
-                is_suggest = jb.get("is_suggest", False)
-                is_ephemeral = jb.get("ephemeral", is_ephemeral)
-            except Exception:
-                pass
-
-        if not text:
-            return PlainTextResponse("Ошибка: тело запроса пустое.\n", status_code=400)
-
-        ephemeral_id = None
-        if is_ephemeral and not dialog_id:
-            ephemeral_id = await manager.create_new_dialog(agent_id=agent, is_ephemeral=True)
-            dialog_id = ephemeral_id
-
-        if stream_mode:
-            async def text_streamer():
-                printed_len = 0
-                last_thought = ""
-                try:
-                    async for turn in manager.send_message(text, agent_id=agent, dialog_id=dialog_id, is_suggest=is_suggest):
-                        if turn.error:
-                            yield f"\n[Ошибка]: {turn.error}\n"
-                            break
-
-                        if turn.thinking_logs and turn.thinking_logs[-1] != last_thought and not turn.text:
-                            last_thought = turn.thinking_logs[-1]
-                            yield f"[Думает: {last_thought}]\n"
-
-                        if turn.text:
-                            delta = turn.text[printed_len:]
-                            if delta:
-                                printed_len = len(turn.text)
-                                yield delta
-
-                        if turn.is_finished:
-                            yield "\n"
-                            if turn.widgets:
-                                seen_urls = set()
-                                for w in turn.widgets:
-                                    if w.url and w.url in seen_urls:
-                                        continue
-                                    if w.url:
-                                        seen_urls.add(w.url)
-                                    yield f"\n--- [📦 {w.title or 'Виджет'}] ---\n"
-                                    if w.url:
-                                        yield f"Ссылка: {w.url}\n"
-                            if turn.suggestions:
-                                yield "\nПодсказки / Тарифы / Адреса:\n"
-                                for i, s in enumerate(turn.suggestions, start=1):
-                                    yield f"  [{i}] {s.title}\n"
-                finally:
-                    if ephemeral_id:
-                        await manager.rpc.delete_dialog(ephemeral_id)
-                        manager.known_dialogs.discard(ephemeral_id)
-                        manager.ephemeral_dialogs.discard(ephemeral_id)
-
-            return StreamingResponse(text_streamer(), media_type="text/plain; charset=utf-8")
+        if not mgr:
+            return PlainTextResponse("Auth Error\n", status_code=401)
 
         final_turn = None
-        try:
-            async for turn in manager.send_message(text, agent_id=agent, dialog_id=dialog_id, is_suggest=is_suggest):
-                final_turn = turn
-        finally:
-            if ephemeral_id:
-                await manager.rpc.delete_dialog(ephemeral_id)
-                manager.known_dialogs.discard(ephemeral_id)
-                manager.ephemeral_dialogs.discard(ephemeral_id)
+        async for turn in mgr.send_message(text):
+            final_turn = turn
 
-        if not final_turn:
-            return PlainTextResponse("Ошибка: нет ответа от сервера Алисы.\n", status_code=504)
-
+        if not final_turn or final_turn.error:
+            return PlainTextResponse(f"Ошибка: {final_turn.error if final_turn else 'no response'}\n", status_code=500)
         return PlainTextResponse(final_turn.text + "\n")
 
     return app
 
 
 async def main_async(args):
-    cookie_str, cookie_dict = load_cookies(args.cookies)
-    manager = AliceAgentManager(cookie_str, cookie_dict, verbose=args.verbose)
+    is_mcp = not args.http
+    allow_interactive = not is_mcp and sys.stdin.isatty()
 
-    logger.info(f"Загрузка агентов: зарегистрировано {len(registry.list_all())} модулей.")
-    await manager.initialize()
+    creds = load_or_request_credentials(
+        explicit_source=args.auth or args.token or args.cookies,
+        allow_interactive=allow_interactive,
+    )
+
+    manager = None
+    if creds:
+        logger.info(f"Healthcheck [{creds.auth_type.upper()}] (UUID: {creds.device_uuid[:8]}...)")
+        is_ok, msg = await verify_credentials(creds)
+        if not is_ok:
+            logger.error(f"[Healthcheck failed]: {msg}")
+            if not is_mcp:
+                sys.exit(1)
+        else:
+            logger.info(f"✓ {msg}")
+            manager = AliceAgentManager(creds, verbose=args.verbose,
+                                        show_thinking=getattr(args, "thinking", False))
+            await manager.initialize()
+    else:
+        if is_mcp:
+            logger.info("MCP в динамическом режиме.")
+        else:
+            logger.error("Учетные данные не найдены.")
+            sys.exit(1)
 
     if args.http:
         import uvicorn
-        logger.info(f"Запуск curl HTTP Сервера на http://{args.host}:{args.port}")
         app = create_curl_http_app(manager)
         config = uvicorn.Config(app, host=args.host, port=args.port, log_level="warning")
         server = uvicorn.Server(config)
         try:
             await server.serve()
         finally:
-            await manager.shutdown()
+            if manager:
+                await manager.shutdown()
     else:
-        logger.info("Запуск Alice MCP stdio Server...")
         mcp = AliceMcpServer(manager)
         try:
             await mcp.run_stdio()
         finally:
-            await manager.shutdown()
+            if manager:
+                await manager.shutdown()
 
 
 def main():
     parser = argparse.ArgumentParser(description="Yandex Alice AI Unified Server")
-    parser.add_argument("--http", action="store_true", help="Запустить HTTP сервер для curl")
-    parser.add_argument("--host", default="127.0.0.1", help="HTTP host")
-    parser.add_argument("--port", type=int, default=8000, help="HTTP port")
-    parser.add_argument("--cookies", default=COOKIE_FILE_DEFAULT, help="Путь к файлу кук (.alice_cookies)")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Компактный лог событий WS и RPC")
+    parser.add_argument("--auth")
+    parser.add_argument("--token")
+    parser.add_argument("--cookies")
+    parser.add_argument("--http", action="store_true")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--thinking", action="store_true")
     args = parser.parse_args()
-
-    log_format = "%(asctime)s [%(levelname)s] %(message)s"
-    if not args.http:
-        logging.basicConfig(level=logging.INFO, format=log_format, stream=sys.stderr)
-    else:
-        logging.basicConfig(level=logging.INFO, format=log_format)
-
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", stream=sys.stderr)
     try:
         asyncio.run(main_async(args))
     except (KeyboardInterrupt, SystemExit):
