@@ -35,11 +35,7 @@ REFERER = "https://alice.yandex.ru/"
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:158.0) Gecko/20100101 Firefox/158.0"
 
 # Cookies, которые РЕАЛЬНО нужны для RPC + safeclick.
-# Остальные (pi, sessar, yandex_expboxes, maps_*, isSmartAuth*, _ym_*, ymex,
-# gdpr, yuidss, bh, yashr, coockoos, bltsr, instruction, Cookie_check, ...) —
-# мусор, раздувающий заголовок до 4 KB → 413 Payload Too Large.
 SEND_COOKIE_KEYS = {
-    # Auth (RPC + safeclick)
     "Session_id",
     "sessionid2",
     "_yasc",
@@ -47,11 +43,9 @@ SEND_COOKIE_KEYS = {
     "yandexuid",
     "yandex_login",
     "L",
-    # Контекст
     "yp",
     "ys",
     "spravka",
-    # Alice-specific
     "alice_uuid",
     "alice_reqids",
 }
@@ -176,8 +170,6 @@ class AliceCredentials:
             return self.token
         return str(uuid.uuid4())
 
-
-# --- Хранилище Device UUID ---
 
 def _safe_read_file(filepath: str) -> Optional[str]:
     try:
@@ -403,16 +395,21 @@ def load_credentials_with_cookies(
         else:
             cookies_creds = c
 
-    # 6. Merge
+    # 6. Merge — ФИКС: device_uuid берём из cookies (alice_uuid/yandexuid),
+    #    чтобы совпадал с браузерным. Иначе диалоги создаются "под другим
+    #    устройством" и не видны в веб-сайдбаре.
     if token_creds and cookies_creds:
         token_creds.cookie_header = cookies_creds.cookie_header
         token_creds.cookie_dict = cookies_creds.cookie_dict
         token_creds.icookie = cookies_creds.icookie or token_creds.icookie
+        if cookies_creds.device_uuid:
+            token_creds.device_uuid = cookies_creds.device_uuid
         token_creds.auth_type = "both"
         logger.info(
             f"Auth: OAuth + cookies "
-            f"(sent {len(token_creds.cookie_header.split(';')) if token_creds.cookie_header else 0} "
-            f"of {len(cookies_creds.cookie_dict)})"
+            f"(device_uuid={token_creds.device_uuid}, "
+            f"cookies {len(token_creds.cookie_header.split(';')) if token_creds.cookie_header else 0}"
+            f"/{len(cookies_creds.cookie_dict)})"
         )
         return token_creds
 
@@ -457,18 +454,14 @@ def show_auth_instructions():
     )
 
 
-# --- Pre-flight Healthcheck ---
-
 async def verify_credentials(creds: AliceCredentials, timeout_sec: float = 7.0) -> Tuple[bool, str]:
     headers = creds.build_rpc_headers()
-
-    # Диагностика размера заголовков
     total = sum(len(k) + len(v) + 4 for k, v in headers.items())
     cookie_len = len(headers.get("Cookie", ""))
     if cookie_len > 2000:
         logger.warning(
             f"Cookie header ≈{cookie_len}B — риск 413. "
-            f"Урежьте SEND_COOKIE_KEYS (уберите spravka/alice_reqids)."
+            f"Урежьте SEND_COOKIE_KEYS."
         )
     logger.debug(f"RPC headers ≈{total}B, Cookie ≈{cookie_len}B")
 
@@ -495,8 +488,7 @@ async def verify_credentials(creds: AliceCredentials, timeout_sec: float = 7.0) 
                 elif status == 413:
                     return False, (
                         f"413 Payload Too Large — заголовки не влезают. "
-                        f"Cookie ≈{cookie_len}B. Урежьте SEND_COOKIE_KEYS "
-                        f"(spravka, alice_reqids — самые крупные)."
+                        f"Cookie ≈{cookie_len}B."
                     )
                 else:
                     return False, f"Ошибка RPC {status}: {body[:150]}"

@@ -69,7 +69,7 @@ logger = logging.getLogger("alice_server")
 
 
 def uuid7() -> str:
-    """RFC 9562 UUIDv7 — совместим с форматом dialog_id Яндекса."""
+    """RFC 9562 UUIDv7 — совместим с форматом dialog_id и messageId Яндекса."""
     ms = int(time.time() * 1000)
     b = bytearray(ms.to_bytes(6, "big") + os.urandom(10))
     b[6] = (b[6] & 0x0F) | 0x70
@@ -79,29 +79,20 @@ def uuid7() -> str:
 
 
 def _parse_nsb_card(card: Dict[str, Any]) -> Tuple[str, List[ThinkingStep], List[Dict[str, Any]]]:
-    """
-    Разбирает neuro_structured_blocks_card.
-    Возвращает (answer_text, thinking_steps, sources).
-    НЕ использует plain_text, если есть json_structured_data.
-    """
     nsb = card.get("neuro_structured_blocks_card")
     if not nsb:
         return "", [], []
-
     structured = nsb.get("json_structured_data")
     if not structured:
         return "", [], []
-
     try:
         data = json.loads(structured) if isinstance(structured, str) else structured
     except (json.JSONDecodeError, TypeError):
         return "", [], []
-
     blocks_data = data.get("BlocksData", [])
     tree_repr = data.get("TreeHierarchyRepresentation", {})
     if not blocks_data:
         return "", [], []
-
     blocks_map = {b.get("Id"): b for b in blocks_data if b.get("Id")}
     answer_parts: List[str] = []
     thinking_steps: List[ThinkingStep] = []
@@ -111,19 +102,16 @@ def _parse_nsb_card(card: Dict[str, Any]) -> Tuple[str, List[ThinkingStep], List
         if not block:
             return
         ct = block.get("ContentType", "")
-
         if ct == "VerticalComposition":
             for cid in block.get("CompositionInfo", {}).get("ChildIds", []):
                 walk(cid)
             return
-
         if ct == "ReasoningSummary":
             rs = block.get("ReasoningSummary", {})
             title = rs.get("Title")
             content = rs.get("Content")
             tool_title = rs.get("ToolTitle")
             tool_type = rs.get("ToolType")
-
             if tool_title and tool_type:
                 thinking_steps.append(ThinkingStep(kind="tool", title=tool_title, tool=tool_type))
             elif title and not content:
@@ -131,7 +119,6 @@ def _parse_nsb_card(card: Dict[str, Any]) -> Tuple[str, List[ThinkingStep], List
             elif content:
                 thinking_steps.append(ThinkingStep(kind="reasoning_content", content=content))
             return
-
         if ct == "Markdown":
             md = block.get("Markdown", {})
             text = (md.get("TargetMarkdownText") or "").strip()
@@ -140,7 +127,6 @@ def _parse_nsb_card(card: Dict[str, Any]) -> Tuple[str, List[ThinkingStep], List
             return
 
     walk(tree_repr.get("Id", ""))
-
     sources: List[Dict[str, Any]] = []
     src_json = nsb.get("json_source_data")
     if src_json:
@@ -150,7 +136,6 @@ def _parse_nsb_card(card: Dict[str, Any]) -> Tuple[str, List[ThinkingStep], List
                 sources = parsed
         except (json.JSONDecodeError, TypeError):
             pass
-
     return "\n\n".join(answer_parts), thinking_steps, sources
 
 
@@ -172,11 +157,6 @@ class AliceRpcClient:
         self.creds = credentials
         self.verbose = verbose
         self.headers = self.creds.build_rpc_headers()
-        if verbose:
-            total = sum(len(k) + len(v) + 4 for k, v in self.headers.items())
-            cookie_len = len(self.headers.get("Cookie", ""))
-            logger.info(f"RPC headers: total≈{total}B, Cookie≈{cookie_len}B, "
-                        f"cookies={len(self.creds.cookie_dict)} (sent={len(self.headers.get('Cookie', '').split(';'))})")
 
     async def get_alice_apps(self) -> Tuple[int, List[Dict[str, Any]], str]:
         url = f"{RPC_BASE_URL}/gproxy/get_alice_apps"
@@ -199,9 +179,7 @@ class AliceRpcClient:
                     status = resp.status
                     body = await resp.text()
                     if status == 200:
-                        objs = json.loads(body).get("objects", [])
-                        logger.warning(f"LIST-DIALOGS count={len(objs)} ids={[o.get('dialog',{}).get('dialog_id') for o in objs][:5]}")
-                        return status, objs, "OK"
+                        return status, json.loads(body).get("objects", []), "OK"
                     return status, [], body[:250]
             except Exception as e:
                 return 0, [], str(e)
@@ -244,12 +222,10 @@ class AliceWsEngine:
 
     async def connect(self):
         headers = self.creds.build_ws_headers()
-
         sig = inspect.signature(websockets.connect)
         ws_kwargs: Dict[str, Any] = {"ping_interval": None}
         if "max_size" in sig.parameters:
             ws_kwargs["max_size"] = 20 * 1024 * 1024
-
         if "additional_headers" in sig.parameters:
             ws_kwargs["additional_headers"] = headers
         else:
@@ -289,7 +265,7 @@ class AliceWsEngine:
             await self.ws.send(json.dumps(data, ensure_ascii=False))
 
     async def _synchronize_state(self):
-        msg_id = str(uuid.uuid4())
+        msg_id = uuid7()
         payload = {
             "event": {
                 "header": {
@@ -315,12 +291,6 @@ class AliceWsEngine:
                 },
             }
         }
-        logger.warning(
-            f"DIALOG-OUT dialog_id={dialog_id} "
-            f"dialog_type={header_dict.get('dialog_type')} "
-            f"preset={agent.preset} mode={agent.mode} "
-            f"app_id={payload['event']['payload']['application']['app_id']}"
-        )
         await self._send_json(payload)
 
     async def _flush_subscriptions(self):
@@ -338,7 +308,7 @@ class AliceWsEngine:
         payload = {
             "event": {
                 "header": {"namespace": "System", "name": "ClientSubscriptionState",
-                           "messageId": str(uuid.uuid4())},
+                           "messageId": uuid7()},
                 "payload": {"subscriptions": subs},
             }
         }
@@ -374,7 +344,6 @@ class AliceWsEngine:
         size = os.path.getsize(path)
         if size == 0:
             return None
-
         title = title or os.path.basename(path)
         if not mime_type:
             guessed, _ = mimetypes.guess_type(path)
@@ -383,10 +352,9 @@ class AliceWsEngine:
         async with self._upload_lock:
             stream_id = self._next_stream_id
             self._next_stream_id += 1
-            message_id = str(uuid.uuid4())
+            message_id = uuid7()
             queue: asyncio.Queue = asyncio.Queue()
             self._upload_pending[message_id] = queue
-
             try:
                 await self._send_json({
                     "event": {
@@ -398,16 +366,13 @@ class AliceWsEngine:
                         }},
                     }
                 })
-
                 try:
                     ack = await asyncio.wait_for(queue.get(), timeout=15.0)
                 except asyncio.TimeoutError:
                     return None
-
                 start = ack.get("file_upload_start") or {}
                 chunk_size = int(start.get("max_chunk_size") or 10 * 1024 * 1024)
                 chunk_size = max(512 * 1024, min(chunk_size, 16 * 1024 * 1024))
-
                 async with self._send_lock:
                     if not self.ws:
                         raise ConnectionError("WS закрыт")
@@ -419,16 +384,14 @@ class AliceWsEngine:
                             if not self.ws or not self.is_connected:
                                 raise ConnectionError("WS закрыт")
                             await self.ws.send(chunk)
-
                 await self._send_json({
                     "event": {
                         "header": {"namespace": "File", "name": "Upload",
-                                   "streamId": stream_id, "messageId": str(uuid.uuid4()),
+                                   "streamId": stream_id, "messageId": uuid7(),
                                    "refMessageId": message_id},
                         "payload": {"chunk_upload_finish": {"is_last": True}},
                     }
                 })
-
                 deadline = asyncio.get_event_loop().time() + timeout
                 finish: Dict[str, Any] = {}
                 while True:
@@ -443,11 +406,9 @@ class AliceWsEngine:
                     if fp:
                         finish = fp
                         break
-
                 file_guid = finish.get("file_guid")
                 if not file_guid:
                     return None
-
                 try:
                     if self.ws and self.is_connected:
                         await self.ws.send(json.dumps({
@@ -456,7 +417,6 @@ class AliceWsEngine:
                         }, ensure_ascii=False))
                 except Exception:
                     pass
-
                 return {
                     "file_guid": file_guid,
                     "title": finish.get("title") or title,
@@ -468,15 +428,65 @@ class AliceWsEngine:
             finally:
                 self._upload_pending.pop(message_id, None)
 
+    @staticmethod
+    def _inject_chat_context(
+        capabilities: List[Dict[str, Any]],
+        dialog_id: str,
+        agent: AliceAgent,
+    ) -> List[Dict[str, Any]]:
+        chat_ctx = {
+            "dialog_id": dialog_id,
+            "dialog_type": "DEDICATED_CHAT",
+            "alice2_mode_info": {
+                "preset": getattr(agent, "preset", "") or "",
+                "mode": getattr(agent, "mode", "") or "Pro",
+            },
+        }
+        for cap in capabilities:
+            if isinstance(cap, dict) and str(cap.get("@type", "")).endswith("TAliceChatCapability"):
+                state = cap.setdefault("state", {})
+                if isinstance(state, dict):
+                    state["active_chat_dialog_context"] = chat_ctx
+                    return capabilities
+        capabilities.append({
+            "@type": "type.googleapis.com/NAlice.TAliceChatCapability",
+            "meta": {
+                "supported_directives": [
+                    "ScrollToFragmentDirectiveType",
+                    "LoginWithCallbackDirectiveType",
+                    "ShowBannerDirectiveType",
+                    "ShowNotificationDirectiveType",
+                    "SetChatRequestModeDirectiveType",
+                    "ShowFullscreenImageGalleryDirectiveType",
+                    "DownloadImageDirectiveType",
+                    "FillChatInputDirectiveType",
+                    "CreateNewChatDirectiveType",
+                    "OpenChatListDirectiveType",
+                    "ChatNavigateBackDirectiveType",
+                ]
+            },
+            "parameters": {
+                "supports_rich_answers": True,
+                "supports_rich_suggests": True,
+                "supports_rich_summary": True,
+            },
+            "state": {
+                "active_chat_dialog_context": chat_ctx,
+            },
+        })
+        return capabilities
+
     async def send_text_input(
         self, text: str, dialog_id: str, agent: AliceAgent,
         prev_req_id: Optional[str] = None, is_suggest: bool = False,
         attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> AsyncGenerator[AliceTurnResponse, None]:
-        req_id = str(uuid.uuid4())
+        req_id = uuid7()
         capabilities = agent.build_capabilities(dialog_id, self.creds.device_uuid)
+        capabilities = self._inject_chat_context(capabilities, dialog_id, agent)
+
         header_dict: Dict[str, Any] = {
-            "request_id": req_id, "dialog_id": dialog_id, "dialog_type": 0, # "dialog_type": 1,
+            "request_id": req_id, "dialog_id": dialog_id, "dialog_type": 2,
         }
         if prev_req_id:
             header_dict["prev_req_id"] = prev_req_id
@@ -583,7 +593,7 @@ class AliceWsEngine:
                 if name == "Ping":
                     pong = {"event": {"header": {
                         "namespace": "System", "name": "Pong",
-                        "messageId": str(uuid.uuid4()),
+                        "messageId": uuid7(),
                         "refMessageId": header.get("messageId"),
                     }, "payload": {}}}
                     await self._send_json(pong)
@@ -629,7 +639,6 @@ class AliceWsEngine:
                     agent = self._active_agents_by_req.get(ref_id) or registry.get("pro")
 
                     for card in cards:
-                        # 1. Пробуем структурированный парсер
                         answer_text, thinking_steps, sources = _parse_nsb_card(card)
                         if thinking_steps:
                             turn.thinking_steps = thinking_steps
@@ -637,23 +646,16 @@ class AliceWsEngine:
                             turn.sources = sources
                         if answer_text and answer_text not in text_blocks:
                             text_blocks.append(answer_text)
-
                         if answer_text or thinking_steps:
                             continue
-
-                        # 2. Специфичный агент
                         handled = agent.parse_card(card, turn, text_blocks)
                         if handled:
                             continue
-
-                        # 3. Fallback: text_card
                         tc = card.get("text_card")
                         if tc and "text" in tc:
                             t = tc["text"].strip()
                             if t and t not in text_blocks:
                                 text_blocks.append(t)
-
-                        # 4. Fallback: plain_text ТОЛЬКО если нет structured
                         nsb = card.get("neuro_structured_blocks_card")
                         if nsb and not nsb.get("json_structured_data"):
                             pt = (nsb.get("plain_text") or "").strip()
@@ -674,7 +676,6 @@ class AliceWsEngine:
                         error=turn.error,
                     )
                     await self._pending_responses[ref_id].put(turn_copy)
-
                     if is_last:
                         accumulated_turns.pop(ref_id, None)
 
@@ -704,7 +705,7 @@ class AliceAgentManager:
         self.known_dialogs: Set[str] = set()
         self.ephemeral_dialogs: Set[str] = set()
 
-    async def initialize(self):
+    async def initialize(self, initial_dialog_id: Optional[str] = None):
         status, apps, _ = await self.rpc.get_alice_apps()
         if status == 200:
             for app in apps:
@@ -728,9 +729,10 @@ class AliceAgentManager:
                 self.known_dialogs.add(did)
                 if not self.active_dialog_id:
                     self.active_dialog_id = did
-        
-        status, dialogs, _ = await self.rpc.list_dialogs(limit=10)
-        logger.info(f"dialog/list: status={status}, count={len(dialogs)}")
+
+        if initial_dialog_id:
+            self.active_dialog_id = initial_dialog_id
+            self.known_dialogs.add(initial_dialog_id)
 
         if not self.active_dialog_id:
             self.active_dialog_id = uuid7()

@@ -63,8 +63,6 @@ class AliceToolsSession(AliceCliSession):
 
         self._setup_extended_autocomplete()
 
-    # ---------- autocomplete ----------
-
     def _setup_extended_autocomplete(self):
         if not readline:
             return
@@ -79,8 +77,6 @@ class AliceToolsSession(AliceCliSession):
         agents = list(registry.all_aliases().keys())
         readline.set_completer(AliceCompleter(commands, agents).complete)
         readline.parse_and_bind("tab: complete")
-
-    # ---------- banner / help ----------
 
     def _expert_badge(self) -> str:
         left = getattr(self.manager.ws, "expert_trial_left", None)
@@ -128,8 +124,6 @@ class AliceToolsSession(AliceCliSession):
   {ACCENT_CYAN}clear{RESET} / {ACCENT_CYAN}help{RESET} / {ACCENT_CYAN}exit{RESET}
 {tools_block}""")
 
-    # ---------- rendering ----------
-
     def _render_thinking(self, steps: List[ThinkingStep]):
         if not steps:
             return
@@ -172,8 +166,6 @@ class AliceToolsSession(AliceCliSession):
             else:
                 print(f"{TEXT_MUTED}{log}{RESET}")
 
-    # ---------- approval / meeseeks events ----------
-
     async def _approve_tool(self, name: str, call_args: Dict[str, Any]) -> bool:
         if self.yolo:
             return True
@@ -196,10 +188,7 @@ class AliceToolsSession(AliceCliSession):
         }.get(kind, f"🧞 {kind}")
         print(f"{prefix} [{handle}] {DIM}{agent_id}{RESET}: {info}")
 
-    # ---------- turn execution ----------
-
     async def _execute_turn_expert(self, user_text: str):
-        """Expert-путь: chat-based tool_call + автоскачивание FileGuid."""
         assert self.expert_bridge is not None
         try:
             async for turn in self.expert_bridge.send_with_tools(
@@ -209,14 +198,11 @@ class AliceToolsSession(AliceCliSession):
                 if turn.error:
                     print(f"\n\033[31m[Ошибка]: {turn.error}{RESET}\n")
                     return
-
                 if turn.thinking_logs and not turn.text:
                     self._render_thinking_logs(turn.thinking_logs)
                     continue
-
                 if turn.text:
                     print(turn.text, end="", flush=True)
-
                 if turn.is_finished:
                     print()
                     if self.show_thinking and turn.thinking_steps:
@@ -229,11 +215,9 @@ class AliceToolsSession(AliceCliSession):
             print(f"\n\033[31m[Ошибка Expert]: {e}{RESET}")
 
     async def _execute_turn_bridge(self, user_text: str, is_suggest: bool = False):
-        """Pro/Base-путь: LocalToolBridge с prompt-injection tool_call."""
         assert self.bridge is not None
         initial = self._pending_attach
         self._pending_attach = None
-
         try:
             async for turn in self.bridge.send_with_tools(
                 user_text, dialog_id=self.dialog_id, agent_id=self.current_agent,
@@ -243,14 +227,11 @@ class AliceToolsSession(AliceCliSession):
                 if turn.error:
                     print(f"\n\033[31m[Ошибка]: {turn.error}{RESET}\n")
                     return
-
                 if turn.thinking_logs and not turn.text:
                     self._render_thinking_logs(turn.thinking_logs)
                     continue
-
                 if turn.text:
                     print(turn.text, end="", flush=True)
-
                 if turn.is_finished:
                     print()
                     if self.show_thinking and turn.thinking_steps:
@@ -275,17 +256,11 @@ class AliceToolsSession(AliceCliSession):
             print(f"\n\033[31m[Ошибка]: {e}{RESET}")
 
     async def execute_turn(self, user_text: str, is_suggest: bool = False):
-        # Expert — отдельный путь
         if self.current_agent == "expert" and self.expert_bridge and not is_suggest:
             return await self._execute_turn_expert(user_text)
-
-        # Pro/Base — через bridge, или напрямую если bridge нет / это suggest
         if not self.bridge or is_suggest:
             return await super().execute_turn(user_text, is_suggest=is_suggest)
-
         return await self._execute_turn_bridge(user_text, is_suggest=is_suggest)
-
-    # ---------- main loop ----------
 
     async def run_loop(self):
         if self.is_ephemeral:
@@ -314,19 +289,14 @@ class AliceToolsSession(AliceCliSession):
             cmd = parts[0]
             arg = parts[1].strip() if len(parts) > 1 else ""
 
-            # --- exit ---
             if cmd in ("exit", "bye", "quit", "q"):
                 break
-
-            # --- help / list ---
             elif cmd in ("help", "?"):
                 self.print_help()
                 continue
             elif cmd in ("list", "agents"):
                 self.print_agents_table()
                 continue
-
-            # --- agent switch ---
             elif cmd in ("agent", "model"):
                 if not arg:
                     a = registry.get(self.current_agent)
@@ -338,15 +308,11 @@ class AliceToolsSession(AliceCliSession):
                     self.current_agent = a.id
                     print(f"{ACCENT_GREEN}✓{RESET} → {BOLD}{a.name}{RESET} (id={a.id})")
                 continue
-
-            # --- expert shortcut ---
             elif cmd == "expert":
                 a = registry.get("expert")
                 self.current_agent = a.id
                 print(f"{ACCENT_GREEN}✓{RESET} → {BOLD}{a.name}{RESET} (preset={a.preset})")
                 continue
-
-            # --- ephemeral ---
             elif cmd == "ephemeral":
                 if arg in ("on", "1"):
                     self.is_ephemeral = True
@@ -362,8 +328,6 @@ class AliceToolsSession(AliceCliSession):
                 else:
                     print(f"{TEXT_MUTED}ephemeral: {self.is_ephemeral}{RESET}")
                 continue
-
-            # --- new dialog ---
             elif cmd == "new":
                 self.dialog_id = await self.manager.create_new_dialog(
                     agent_id=self.current_agent, is_ephemeral=self.is_ephemeral,
@@ -373,14 +337,10 @@ class AliceToolsSession(AliceCliSession):
                 self.active_suggestions = []
                 print(f"{ACCENT_GREEN}✓{RESET} Новый диалог: {self.dialog_id[:12]}...")
                 continue
-
-            # --- clear screen ---
             elif cmd == "clear":
                 os.system("cls" if os.name == "nt" else "clear")
                 self.print_banner()
                 continue
-
-            # --- dialogs ---
             elif cmd == "dialogs":
                 print(f"\n{BOLD}Диалоги:{RESET}")
                 for did in self.manager.known_dialogs:
@@ -389,8 +349,6 @@ class AliceToolsSession(AliceCliSession):
                     print(f"  {did}{eph}{active}")
                 print()
                 continue
-
-            # --- tools ---
             elif cmd == "tools":
                 if not self.tools or not self.tools.tools:
                     print(f"{TEXT_MUTED}Инструменты не загружены{RESET}")
@@ -400,8 +358,6 @@ class AliceToolsSession(AliceCliSession):
                     print(f"  {ACCENT_YELLOW}{name}{RESET}: {tool.description}")
                 print()
                 continue
-
-            # --- exec ---
             elif cmd == "exec":
                 if not self.tools or "shell" not in self.tools.tools:
                     print(f"{TEXT_MUTED}shell не сконфигурирован{RESET}")
@@ -416,8 +372,6 @@ class AliceToolsSession(AliceCliSession):
                 else:
                     print(f"\033[31m{res.error or res.output}{RESET}")
                 continue
-
-            # --- attach ---
             elif cmd == "attach":
                 if not arg:
                     print(f"{TEXT_MUTED}/attach <path>{RESET}")
@@ -442,8 +396,6 @@ class AliceToolsSession(AliceCliSession):
                 print(f"{ACCENT_GREEN}✓{RESET} {BOLD}{result.get('title')}{RESET} "
                       f"({size_kb:.1f} KB) — прикрепится к следующему сообщению")
                 continue
-
-            # --- yolo ---
             elif cmd == "yolo":
                 if arg in ("on", "1"):
                     self.yolo = True
@@ -454,8 +406,6 @@ class AliceToolsSession(AliceCliSession):
                 else:
                     print(f"{TEXT_MUTED}yolo: {self.yolo}{RESET}")
                 continue
-
-            # --- meeseeks (single) ---
             elif cmd == "meeseeks":
                 if not self.meeseeks_pool:
                     print(f"{TEXT_MUTED}Мисиксы отключены{RESET}")
@@ -478,8 +428,6 @@ class AliceToolsSession(AliceCliSession):
                     self._render_thinking(r.thinking_steps)
                 print(r.text or r.error or "(пусто)")
                 continue
-
-            # --- meeseeks batch ---
             elif cmd in ("meeseeks-batch", "meeseeks_batch"):
                 if not self.meeseeks_pool:
                     print(f"{TEXT_MUTED}Мисиксы отключены{RESET}")
@@ -511,7 +459,6 @@ class AliceToolsSession(AliceCliSession):
                     print()
                 continue
 
-            # --- numeric suggestion ---
             is_suggest = False
             if text.isdigit() and self.active_suggestions:
                 idx = int(text) - 1
@@ -542,6 +489,9 @@ async def async_main():
                         help="Отключить инструменты")
     parser.add_argument("--no-meeseeks", action="store_true",
                         help="Отключить мисиксы")
+    # NEW: продолжить существующий диалог (ID с сайта — /chat/<uuid>)
+    parser.add_argument("--dialog-id", default=None,
+                        help="Продолжить существующий диалог (ID с сайта)")
     args = parser.parse_args()
 
     creds = load_or_request_credentials(
@@ -563,12 +513,11 @@ async def async_main():
 
     manager = AliceAgentManager(creds, verbose=args.verbose, show_thinking=args.thinking)
     try:
-        await manager.initialize()
+        await manager.initialize(initial_dialog_id=args.dialog_id)
     except Exception as e:
         print(f"\n\033[31m[Ошибка подключения]: {e}{RESET}")
         sys.exit(1)
 
-    # --- config ---
     config_path = args.tools_config or DEFAULT_CONFIG
     raw_cfg: Dict[str, Any] = {}
     if os.path.exists(config_path):
@@ -578,7 +527,6 @@ async def async_main():
         except Exception as e:
             print(f"\033[31m[Ошибка чтения {config_path}]: {e}{RESET}")
 
-    # --- tools ---
     tools: Optional[LocalToolRegistry] = None
     if not args.no_tools:
         if os.path.exists(config_path):
@@ -599,7 +547,6 @@ async def async_main():
         else:
             print(f"{TEXT_MUTED}[info] {config_path} не найден — режим без инструментов{RESET}")
 
-    # --- session ---
     session = AliceToolsSession(
         manager=manager,
         default_agent=args.agent,
@@ -610,8 +557,10 @@ async def async_main():
         yolo=args.yolo,
         show_thinking=args.thinking,
     )
+    if args.dialog_id:
+        session.dialog_id = args.dialog_id
+        session.active_suggestions = []
 
-    # --- meeseeks ---
     if tools and not args.no_meeseeks:
         mk_cfg = raw_cfg.get("meeseeks") or {}
         if mk_cfg.get("enabled", True):
@@ -634,7 +583,6 @@ async def async_main():
             print(f"{ACCENT_GREEN}✓{RESET} Мисиксы: {BOLD}{len(tools.tools)}{RESET} инструментов, "
                   f"глубина {pool.max_depth}, параллельно {pool.max_concurrent}")
 
-    # --- bridge (pro/base) ---
     if tools:
         session.bridge = LocalToolBridge(
             manager, tools, agent_id=args.agent,
