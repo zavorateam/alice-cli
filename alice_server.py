@@ -19,7 +19,10 @@ from datetime import datetime
 import aiohttp
 import websockets
 
-from agents import AgentWidget, AliceAgent, AliceTurnResponse, SuggestionAction, ThinkingStep, registry
+from agents import (
+    AgentWidget, AliceAgent, AliceTurnResponse, SuggestionAction,
+    ThinkingStep, ensure_agents_registered, registry,
+)
 from tools.effective import EffectiveMode, normalize_effective_mode
 from agents.expert import ExpertAgent
 from alice_auth import (
@@ -864,14 +867,17 @@ class AliceAgentManager:
         self.ephemeral_dialogs: Set[str] = set()
 
     async def initialize(self, initial_dialog_id: Optional[str] = None):
-        if not registry._agents.get("expert"):
-            registry.register(ExpertAgent())
-            logger.info("Registered ExpertAgent (preset=agents_RnServiceAliceExpert)")
-
         try:
-            registry.auto_discover()
+            ensure_agents_registered()
         except Exception as e:
-            logger.warning(f"auto_discover: {e}")
+            logger.warning(f"ensure_agents_registered: {e}")
+
+        if not registry._agents.get("expert"):
+            try:
+                registry.register(ExpertAgent())
+                logger.info("Registered ExpertAgent (preset=agents_RnServiceAliceExpert)")
+            except Exception as e:
+                logger.warning(f"ExpertAgent registration: {e}")
 
         status, apps, _ = await self.rpc.get_alice_apps()
         if status == 200:
@@ -980,6 +986,7 @@ class AliceAgentManager:
 
 class AliceMcpServer:
     def __init__(self, manager: Optional[AliceAgentManager] = None):
+        ensure_agents_registered()
         self.manager = manager
         self._managers_cache: Dict[str, AliceAgentManager] = {}
 
