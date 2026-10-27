@@ -4,6 +4,7 @@ import asyncio
 import websockets
 
 
+from websockets.exceptions import ConnectionClosed
 def test_listener_sets_ws_none_on_connectionclosed():
     """_listen_loop при ConnectionClosed должен выставить ws=None и выйти."""
     from alice_auth import AliceCredentials
@@ -14,7 +15,7 @@ def test_listener_sets_ws_none_on_connectionclosed():
 
         class _FakeWS:
             async def recv(self):
-                raise websockets.exceptions.ConnectionClosed(None, None)
+                raise ConnectionClosed(None, None)
             async def close(self):
                 return None
 

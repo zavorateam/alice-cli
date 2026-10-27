@@ -87,7 +87,19 @@ def test_notifications_initialized_has_no_response():
                        "clientInfo": {"name": "t", "version": "0"}},
         }) + "\n")
         proc.stdin.flush()
-        select.select([proc.stdout], [], [], 15)
+        ready, _, _ = select.select([proc.stdout], [], [], 15)
+        if not ready:
+            err = ""
+            try:
+                import fcntl
+                fd = proc.stderr.fileno()
+                fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+                fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+                if select.select([proc.stderr], [], [], 0.2)[0]:
+                    err = proc.stderr.read(2000) or ""
+            except Exception:
+                pass
+            raise AssertionError(f"MCP init no response in 15s; stderr={err[:800]!r}")
         line1 = proc.stdout.readline()
         assert json.loads(line1)["result"]["serverInfo"]["name"] == "yandex-alice-server"
 

@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import uuid
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
@@ -181,16 +182,35 @@ def _safe_read_file(filepath: str) -> Optional[str]:
     return None
 
 
-def _safe_write_file(filepath: str, content: str) -> bool:
+def _safe_write_file(filepath: str, content: str, mode: int = 0o600) -> bool:
+    """Атомарная запись с правами только для владельца."""
     try:
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(content)
-        return True
+        parent = os.path.dirname(os.path.abspath(filepath)) or "."
+        os.makedirs(parent, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=parent, prefix=".tmp-w-", suffix="-" + os.path.basename(filepath))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+            try:
+                os.chmod(tmp, mode)
+            except OSError:
+                pass
+            os.replace(tmp, filepath)
+            return True
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     except (OSError, PermissionError) as e:
         logger.warning(f"Файл {filepath} недоступен для записи ({e}).")
         return False
-
-
 def get_or_create_device_uuid(custom_token_file: Optional[str] = None) -> str:
     if custom_token_file:
         content = _safe_read_file(custom_token_file)
@@ -317,6 +337,7 @@ def load_credentials_with_cookies(
     token_source: Optional[str] = None,
     cookies_source: Optional[str] = None,
     allow_interactive: bool = True,
+    strict_explicit: bool = False,
 ) -> Optional[AliceCredentials]:
     """
     Загружает ОБА источника: OAuth (для RPC/WS) + cookies (для safeclick).
@@ -324,6 +345,7 @@ def load_credentials_with_cookies(
     """
     token_creds: Optional[AliceCredentials] = None
     cookies_creds: Optional[AliceCredentials] = None
+    explicit_attempted = bool(token_source or cookies_source)
 
     # 1. Явный token source
     if token_source:
@@ -340,6 +362,10 @@ def load_credentials_with_cookies(
             cookies_creds = c
         elif c and c.auth_type == "token" and not token_creds:
             token_creds = c
+
+    if strict_explicit and explicit_attempted and not (token_creds or cookies_creds):
+        logger.error("Явно указанные credentials не удалось разобрать; fallback отключён.")
+        return None
 
     # 3. Env
     if token_creds is None:

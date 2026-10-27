@@ -2,7 +2,12 @@ import asyncio
 import logging
 import os
 from typing import Optional
-from playwright.async_api import async_playwright
+try:
+    from playwright.async_api import async_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    async_playwright = None  # type: ignore
 
 logger = logging.getLogger("expert_browser")
 
@@ -14,6 +19,11 @@ class ExpertBrowser:
 
     async def download_file(self, file_guid: str, filename: Optional[str] = None) -> Optional[str]:
         """Открывает безопасную ссылку через headless Chromium и перехватывает скачивание."""
+        if not PLAYWRIGHT_AVAILABLE:
+            logger.error(
+                "Playwright не установлен. Установите: `pip install playwright && playwright install chromium`"
+            )
+            return None
         url = f"https://rpc.alice.yandex.ru/gproxy/get_source_file?FileGuid={file_guid}"
         dest = os.path.join(self.download_dir, filename or f"{file_guid}.bin")
         

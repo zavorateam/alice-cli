@@ -54,18 +54,42 @@ def mcp_proc(tmp_path):
             proc.wait()
 
 
+def _peek_stderr(proc, limit=2000):
+    """Неблокирующее чтение stderr — не должно висеть при живом subprocess."""
+    try:
+        import fcntl
+        fd = proc.stderr.fileno()
+        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+    except Exception:
+        return ""
+    try:
+        if select.select([proc.stderr], [], [], 0.2)[0]:
+            try:
+                return (proc.stderr.read(limit) or "")[:limit]
+            except (BlockingIOError, OSError):
+                return ""
+    except Exception:
+        pass
+    finally:
+        try:
+            import fcntl
+            fd = proc.stderr.fileno()
+            fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, fl & ~os.O_NONBLOCK)
+        except Exception:
+            pass
+    return ""
+
+
 def _readline(proc, timeout=15.0):
     ready, _, _ = select.select([proc.stdout], [], [], timeout)
     if not ready:
-        err = ""
-        try:
-            err = proc.stderr.read(2000)
-        except Exception:
-            pass
+        err = _peek_stderr(proc)
         raise AssertionError(f"no response in {timeout}s; stderr={err[:500]!r}")
     line = proc.stdout.readline()
     if not line:
-        err = proc.stderr.read(2000)
+        err = _peek_stderr(proc)
         raise AssertionError(f"EOF from MCP; stderr={err[:800]!r}")
     return line
 

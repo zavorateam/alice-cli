@@ -21,11 +21,24 @@ class AgentRegistry:
         self._alias_map: Dict[str, AliceAgent] = {}
 
     def register(self, agent: AliceAgent):
+        old = self._agents.get(agent.id)
+        if old is not None and old is not agent:
+            # Убираем stale aliases от старого экземпляра
+            stale = [k for k, v in self._alias_map.items() if v is old]
+            for k in stale:
+                del self._alias_map[k]
         self._agents[agent.id] = agent
         self._alias_map[agent.id.lower()] = agent
         self._alias_map[agent.name.lower()] = agent
         for alias in agent.aliases:
-            self._alias_map[alias.lower()] = agent
+            key = alias.lower()
+            existing = self._alias_map.get(key)
+            if existing is not None and existing is not agent and existing.id != agent.id:
+                logger.warning(
+                    f"alias '{alias}' конфликтует: {existing.id} → {agent.id}; "
+                    f"побеждает последний"
+                )
+            self._alias_map[key] = agent
 
     def get(self, identifier: Optional[str]) -> AliceAgent:
         ident = (identifier or "pro").strip().lower()

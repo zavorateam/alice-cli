@@ -1,9 +1,14 @@
+*.pyc
 .alice_cookies
 .alice_device_uuid
+.alice_token
+.coverage
+.pytest_cache
 .venv
 __pycache__
 agents/__pycache__
-token.txt
 alice_tools.json
+cookies.txt
+tests/fixtures/*.zip
+token.txt
 trace_exports
-.pytest_cache

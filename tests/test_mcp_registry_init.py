@@ -45,20 +45,33 @@ def test_ensure_agents_registered_idempotent():
 
 
 def test_mcp_server_ensures_agents():
-    """AliceMcpServer.__init__ сам вызывает ensure_agents_registered()."""
+    """AliceMcpServer.__init__ сам вызывает ensure_agents_registered().
+
+    Восстанавливает registry в finally, чтобы не ломать другие тесты.
+    """
     from agents.registry import registry
+    from agents import reset_registration_state, ensure_agents_registered
     from alice_server import AliceMcpServer
 
-    # Сбрасываем флаг, чтобы увидеть эффект от McpServer на чистый registry
-    import agents as agents_pkg
-    agents_pkg._discovered = False
-    registry._agents.clear()
-    registry._alias_map.clear()
-
-    assert len(registry.list_all()) == 0
-    AliceMcpServer(manager=None)
-    ids = {a.id for a in registry.list_all()}
-    assert {"pro", "base", "expert"}.issubset(ids)
+    ensure_agents_registered()  # гарантированно заполним
+    saved_agents = dict(registry._agents)
+    saved_aliases = dict(registry._alias_map)
+    try:
+        reset_registration_state()
+        registry._agents.clear()
+        registry._alias_map.clear()
+        assert len(registry.list_all()) == 0
+        AliceMcpServer(manager=None)
+        ids = {a.id for a in registry.list_all()}
+        assert {"pro", "base", "expert"}.issubset(ids)
+    finally:
+        registry._agents.clear()
+        registry._agents.update(saved_agents)
+        registry._alias_map.clear()
+        registry._alias_map.update(saved_aliases)
+        # помечаем _discovered=True, чтобы не пересканировать зря
+        import agents as _ag
+        _ag._discovered = True
 
 
 def test_tools_definition_nonempty_without_creds():

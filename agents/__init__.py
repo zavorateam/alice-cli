@@ -42,16 +42,28 @@ _discovered = False
 def ensure_agents_registered() -> int:
     """Идемпотентная регистрация встроенных агентов.
 
-    Первый вызов сканирует пакет и регистрирует агентов.
-    Последующие — no-op (возвращают количество зарегистрированных).
-    Dynamic apps (get_alice_apps) регистрируются отдельно в
-    AliceAgentManager.initialize, они не входят в этот набор.
+    _discovered ставится в True только после успешной регистрации (>0 агентов).
+    При частичном сбое discovery повторный вызов попробует снова.
     """
     global _discovered
-    if _discovered:
-        return len(registry.list_all())
-    _discovered = True
-    count = registry.auto_discover(_agents_dir, "agents")
-    if count == 0:
-        _log.warning(f"ensure_agents_registered: 0 агентов в {_agents_dir}")
+    # Defensive: если _discovered=True, но registry пуст (тест очистил) — пересканируем
+    if _discovered and not registry.list_all():
+        _log.info("ensure_agents_registered: _discovered=True но registry пуст — пересканирую")
+        _discovered = False
+    if not _discovered:
+        try:
+            count = registry.auto_discover(_agents_dir, "agents")
+        except Exception as e:
+            _log.warning(f"ensure_agents_registered: discovery упал: {e!r}")
+            count = 0
+        if count > 0:
+            _discovered = True
+        else:
+            _log.warning("ensure_agents_registered: 0 агентов — повтор при следующем вызове")
     return len(registry.list_all())
+
+
+def reset_registration_state() -> None:
+    """Для тестов: сбросить флаг, не трогая registry."""
+    global _discovered
+    _discovered = False

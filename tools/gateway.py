@@ -107,10 +107,21 @@ class ModelCatalog:
             if not self._should_recheck(state):
                 return state
             started = time.monotonic()
+            ephemeral_id = None
             try:
                 mgr = self._manager_provider()
                 turn = None
-                async for t in mgr.send_message("Ответь одним словом: ok", agent_id=state.agent_id):
+                create = getattr(mgr, "create_new_dialog", None)
+                if callable(create):
+                    try:
+                        ephemeral_id = await create(agent_id=state.agent_id, is_ephemeral=True)
+                    except Exception as e:
+                        logger.debug(f"healthcheck: create_new_dialog failed: {e!r}")
+                        ephemeral_id = None
+                send_kwargs = {"agent_id": state.agent_id}
+                if ephemeral_id:
+                    send_kwargs["dialog_id"] = ephemeral_id
+                async for t in mgr.send_message("Ответь одним словом: ok", **send_kwargs):
                     turn = t
                 elapsed_ms = (time.monotonic() - started) * 1000.0
                 state.elapsed_ms = elapsed_ms
@@ -145,6 +156,54 @@ class ModelCatalog:
                 state.reason = f"{type(e).__name__}: {e}"
                 state.last_checked = time.time()
                 return state
+            finally:
+                if ephemeral_id:
+                    try:
+                        mgr = self._manager_provider()
+                        rpc = getattr(mgr, "rpc", None)
+                        if rpc is not None and hasattr(rpc, "delete_dialog"):
+                            await rpc.delete_dialog(ephemeral_id)
+                    except Exception:
+                        pass
+
+    def mark_available(self, model_id: str, effective_mode: Optional[str] = None,
+                       effective_preset: Optional[str] = None,
+                       trial_left: Optional[int] = None,
+                       trial_limit: Optional[int] = None) -> None:
+        s = self._states.get(model_id)
+        if s is None:
+            return
+        s.effective_mode = effective_mode
+        s.effective_preset = effective_preset
+        s.trial_left = trial_left
+        s.trial_limit = trial_limit
+        s.last_checked = time.time()
+        if s.requested_mode and effective_mode and \
+                s.requested_mode.lower() != effective_mode.lower():
+            s.status = "degraded"
+            s.reason = f"{s.requested_mode} -> {effective_mode}"
+        else:
+            s.status = "available"
+            s.reason = None
+
+    def mark_unavailable(self, model_id: str, reason: str) -> None:
+        s = self._states.get(model_id)
+        if s is None:
+            return
+        s.status = "unavailable"
+        s.reason = reason
+        s.last_checked = time.time()
+
+    def warm_up(self) -> "asyncio.Task":
+        """Одноразовый healthcheck на базовые модели (не Expert/Apps)."""
+        async def _run():
+            # Только Base — дешёвая и без квоты. Pro/Expert — на явный запрос.
+            for mid in ("alice-base",):
+                try:
+                    await self.healthcheck(mid)
+                except Exception:
+                    pass
+        return asyncio.create_task(_run())
 
     def set_status(self, model_id: str, status: str,
                    reason: Optional[str] = None,
@@ -199,9 +258,23 @@ def _flatten_messages(messages: List[dict]) -> str:
         if role in ("system", "developer"):
             parts.append(f"[{role}] {content}")
         elif role == "assistant":
-            parts.append(f"[assistant] {content}")
+            tool_calls = m.get("tool_calls") or []
+            if tool_calls:
+                text_part = content.strip() if content else ""
+                if text_part:
+                    parts.append(f"[assistant] {text_part}")
+                for tc in tool_calls:
+                    fn = tc.get("function") or {}
+                    name = fn.get("name", "")
+                    args = fn.get("arguments", "")
+                    cid = tc.get("id", "")
+                    parts.append(f"[tool_call id={cid} name={name}] {args}")
+            else:
+                parts.append(f"[assistant] {content}")
         elif role == "tool":
-            parts.append(f"[tool_result name={m.get('name', '')}] {content}")
+            cid = m.get("tool_call_id") or ""
+            name = m.get("name") or ""
+            parts.append(f"[tool_result id={cid} name={name}] {content}")
         else:
             parts.append(str(content))
     return "\n\n".join(parts).strip()
@@ -273,6 +346,12 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
                 {"error": {"message": f"model {model!r} not found", "type": "invalid_request_error"}},
                 status_code=404,
             )
+        if state.status == "unavailable":
+            return JSONResponse(
+                {"error": {"message": f"model {model!r} is currently unavailable: {state.reason}",
+                           "type": "model_unavailable"}},
+                status_code=503,
+            )
         if tool_choice == "none":
             tools = []
 
@@ -305,6 +384,15 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
                     status_code=500,
                 )
             text = last.text if last else ""
+            eff = getattr(last, "effective", None) if last else None
+            if eff is not None and getattr(eff, "effective_mode", None):
+                catalog.mark_available(
+                    model,
+                    effective_mode=eff.effective_mode,
+                    effective_preset=eff.effective_preset,
+                    trial_left=eff.trial_left,
+                    trial_limit=eff.trial_limit,
+                )
             tool_calls = _extract_tool_calls(text, tools)
             message: Dict[str, Any] = {"role": "assistant", "content": None if tool_calls else text}
             finish_reason = "tool_calls" if tool_calls else "stop"
@@ -327,6 +415,10 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
                 "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
             })
             sent = 0
+            # Когда клиент передал tools, финальный текст может содержать
+            # <tool_call>...</tool_call>. В этом случае контент не стримим по кускам,
+            # а ждём is_finished и отдаём delta.tool_calls + finish_reason="tool_calls".
+            buffering_for_tools = bool(tools)
             try:
                 async for turn in session.send_message(prompt, agent_id=agent_id):
                     if getattr(turn, "error", None):
@@ -339,6 +431,78 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
                         })
                         yield "data: [DONE]\n\n"
                         return
+                    if buffering_for_tools:
+                        # ждём is_finished, ничего не стримим
+                        if getattr(turn, "is_finished", False):
+                            full_text = turn.text or ""
+                            tool_calls = _extract_tool_calls(full_text, tools)
+                            if tool_calls:
+                                # Убираем маркеры из видимого контента — они не должны
+                                # утечь как обычный текст при finish_reason="tool_calls".
+                                import re as _re
+                                clean_text = _re.sub(
+                                    r"<tool_call>\s*\{.*?\}\s*</tool_call>",
+                                    "", full_text, flags=_re.DOTALL,
+                                ).strip()
+                                if clean_text:
+                                    yield _sse({
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": model,
+                                        "choices": [{"index": 0,
+                                                     "delta": {"content": clean_text},
+                                                     "finish_reason": None}],
+                                    })
+                                delta_calls = []
+                                for i, tc in enumerate(tool_calls):
+                                    delta_calls.append({
+                                        "index": i,
+                                        "id": tc["id"],
+                                        "type": tc["type"],
+                                        "function": tc["function"],
+                                    })
+                                yield _sse({
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model,
+                                    "choices": [{"index": 0,
+                                                 "delta": {"tool_calls": delta_calls},
+                                                 "finish_reason": None}],
+                                })
+                                yield _sse({
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model,
+                                    "choices": [{"index": 0, "delta": {},
+                                                 "finish_reason": "tool_calls"}],
+                                })
+                            else:
+                                if full_text:
+                                    yield _sse({
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": model,
+                                        "choices": [{"index": 0,
+                                                     "delta": {"content": full_text},
+                                                     "finish_reason": None}],
+                                    })
+                                yield _sse({
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model,
+                                    "choices": [{"index": 0, "delta": {},
+                                                 "finish_reason": "stop"}],
+                                })
+                            yield "data: [DONE]\n\n"
+                            return
+                        continue
+
+                    # Обычный streaming (без tools)
                     new = turn.text[sent:]
                     sent = len(turn.text)
                     if new:

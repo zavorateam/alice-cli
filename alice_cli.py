@@ -822,8 +822,8 @@ async def async_main():
 def main():
     try:
         asyncio.run(async_main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    except KeyboardInterrupt:
+        sys.exit(130)
 
 
 if __name__ == "__main__":

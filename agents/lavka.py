@@ -1,5 +1,4 @@
 import json
-import urllib.request
 from typing import Any, Dict, List
 from agents.base import AgentWidget, AliceAgent, AliceTurnResponse, SuggestionAction, decode_dialog_action
 
@@ -15,7 +14,7 @@ class LavkaAgent(AliceAgent):
     description = "Экспресс-доставка продуктов, готовой еды и сбор корзины"
     timeout = 60.0
 
-    def parse_card(self, card: Dict[str, Any], turn: AliceTurnResponse, text_blocks: List[str]) -> bool:
+    async def parse_card(self, card: Dict[str, Any], turn: AliceTurnResponse, text_blocks: List[str]) -> bool:
         tc = card.get("text_card")
         if tc and "text" in tc:
             t = tc["text"].strip()
@@ -47,51 +46,22 @@ class LavkaAgent(AliceAgent):
             p_ids = tool_output.get("productIds", [])
 
             if p_ids:
-                try:
-                    # Пробуем получить deepLinks из API Лавки
-                    req_payload = {"productIds": p_ids}
-                    if "location" in tool_output:
-                        req_payload["position"] = {"location": tool_output["location"]}
-                    elif "position" in tool_output:
-                        req_payload["position"] = tool_output["position"]
-
-                    req = urllib.request.Request(
-                        "https://lavka.yandex.ru/api/v1/providers/v1/products/list/by-id",
-                        data=json.dumps(req_payload).encode("utf-8"),
-                        headers={
-                            "Content-Type": "application/json",
-                            "User-Agent": "Mozilla/5.0",
-                            "x-lavka-web-locale": "ru-RU",
-                            "x-lavka-web-city": "213",
-                            "x-alice-agent": "true"
-                        },
-                        method="POST"
-                    )
-                    with urllib.request.urlopen(req, timeout=5.0) as response:
-                        resp_data = json.loads(response.read().decode("utf-8"))
-
-                    products = resp_data.get("products", [])
-                    if products:
-                        for p in products:
-                            dl = p.get("deepLink")
-                            title = p.get("title")
-                            if dl and title:
-                                # Формируем ссылку на карточку товара
-                                url = f"https://lavka.yandex.ru/213/good/{dl}"
-                                turn.widgets.append(AgentWidget(
-                                    component_name=ui_name,
-                                    app_id=self.app_id,
-                                    title=title,
-                                    url=url,
-                                    raw_data=p,
-                                ))
-
-                        # Если распарсили хотя бы один товар, не добавляем общую ссылку
-                        if turn.widgets:
-                            return True
-                except Exception:
-                    # Если запрос не удался (timeout/500/403), переходим к фолбэку ниже
-                    pass
+                products = await self._fetch_products(p_ids, tool_output)
+                if products:
+                    for prod in products:
+                        dl = prod.get("deepLink")
+                        title = prod.get("title")
+                        if dl and title:
+                            url = f"https://lavka.yandex.ru/213/good/{dl}"
+                            turn.widgets.append(AgentWidget(
+                                component_name=ui_name,
+                                app_id=self.app_id,
+                                title=title,
+                                url=url,
+                                raw_data=prod,
+                            ))
+                    if turn.widgets:
+                        return True
 
             # Фолбэк: если товаров нет или API недоступно, возвращаем ссылку на общую корзину
             w_title = f"Посмотрела в сервисе Лавка ({len(p_ids)} товаров)" if p_ids else "Посмотрела в сервисе Лавка"
@@ -115,3 +85,35 @@ class LavkaAgent(AliceAgent):
             return True
 
         return False
+
+    async def _fetch_products(self, p_ids, tool_output):
+        """Асинхронный запрос deepLinks через aiohttp, timeout 5s. Возвращает список или None."""
+        try:
+            import aiohttp
+        except ImportError:
+            return None
+        req_payload = {"productIds": p_ids}
+        if "location" in tool_output:
+            req_payload["position"] = {"location": tool_output["location"]}
+        elif "position" in tool_output:
+            req_payload["position"] = tool_output["position"]
+        try:
+            timeout = aiohttp.ClientTimeout(total=5.0, connect=3.0)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    "https://lavka.yandex.ru/api/v1/providers/v1/products/list/by-id",
+                    json=req_payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "User-Agent": "Mozilla/5.0",
+                        "x-lavka-web-locale": "ru-RU",
+                        "x-lavka-web-city": "213",
+                        "x-alice-agent": "true",
+                    },
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json(content_type=None)
+            return data.get("products", []) or None
+        except Exception:
+            return None
