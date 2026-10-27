@@ -544,10 +544,10 @@ class AliceWsEngine:
                         "payload": {"chunk_upload_finish": {"is_last": True}},
                     }
                 })
-                deadline = asyncio.get_event_loop().time() + timeout
+                deadline = asyncio.get_running_loop().time() + timeout
                 finish: Dict[str, Any] = {}
                 while True:
-                    remaining = deadline - asyncio.get_event_loop().time()
+                    remaining = deadline - asyncio.get_running_loop().time()
                     if remaining <= 0:
                         return None
                     try:
@@ -1086,9 +1086,9 @@ class AliceMcpServer:
     async def run_stdio(self):
         reader = asyncio.StreamReader()
         protocol = asyncio.StreamReaderProtocol(reader)
-        await asyncio.get_event_loop().connect_read_pipe(lambda: protocol, sys.stdin)
+        await asyncio.get_running_loop().connect_read_pipe(lambda: protocol, sys.stdin)
 
-        writer_transport, writer_protocol = await asyncio.get_event_loop().connect_write_pipe(
+        writer_transport, writer_protocol = await asyncio.get_running_loop().connect_write_pipe(
             asyncio.streams.FlowControlMixin, sys.stdout
         )
         writer = asyncio.StreamWriter(writer_transport, writer_protocol, reader, asyncio.get_event_loop())

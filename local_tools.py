@@ -377,7 +377,7 @@ class McpStdioClient:
     async def _request(self, method: str, params: Dict) -> Dict:
         self._req_id += 1
         rid = self._req_id
-        fut = asyncio.get_event_loop().create_future()
+        fut = asyncio.get_running_loop().create_future()
         self._pending[rid] = fut
         assert self.proc and self.proc.stdin
         self.proc.stdin.write((json.dumps(

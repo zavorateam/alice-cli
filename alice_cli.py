@@ -449,8 +449,8 @@ class AliceCliSession:
         if self.yolo:
             return True
         try:
-            ans = await asyncio.get_event_loop().run_in_executor(
-                None, input,
+            ans = await asyncio.to_thread(
+                input,
                 f"{ACCENT_YELLOW}Разрешить {BOLD}{name}{RESET}{ACCENT_YELLOW}? [y/N] >>> {RESET}",
             )
         except (EOFError, KeyboardInterrupt):
@@ -606,8 +606,8 @@ class AliceCliSession:
 
         while True:
             try:
-                user_input = await asyncio.get_event_loop().run_in_executor(
-                    None, input, f"{BOLD}{ALICE_RED}>>> {RESET}"
+                user_input = await asyncio.to_thread(
+                    input, f"{BOLD}{ALICE_RED}>>> {RESET}"
                 )
                 text = user_input.strip()
             except (EOFError, KeyboardInterrupt):
