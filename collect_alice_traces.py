@@ -80,12 +80,12 @@ for _p in ("token.txt", ".alice_token", ".alice_cookies", "cookies.txt"):
     except Exception:
         pass
 _secret_values = sorted(set(_secret_values), key=len, reverse=True)
-_SECRET_KEY = re.compile(r"(^|[_-])(authorization|cookie|cookies|token|access_token|refresh_token|secret|password|credential|api_key|apikey|icookie|session_id|sessionid2|spravka|yandexuid|alice_uuid|ya24|hf_token|hugging_face_hub_token|auth|device_uuid|device_id|x-ya-uuid|x-ya-device-id|file.?guid|signature)([_-]|$)", re.I)
+_SECRET_KEY = re.compile(r"(^|[_-])(authorization|cookie|cookies|token|access_token|refresh_token|secret|password|credential|api_key|apikey|icookie|session_id|sessionid2|spravka|yandexuid|alice_uuid|ya24|hf_token|hugging_face_hub_token|auth|uuid|uuid4|client_uuid|deviceUuid|deviceUUID|deviceId|device_uuid|device_id|x-ya-uuid|x-ya-device-id|file.?guid|signature)([_-]|$)", re.I)
 _TOKEN_RE = re.compile(r"y0_[A-Za-z0-9._~+/-]{3,}={0,2}")
 _HEADER_RE = re.compile(r"(?im)\b(authorization\s*:\s*(?:oauth|bearer)?\s*)[^\s,;]+")
 _COOKIE_HEADER_RE = re.compile(r"(?im)\b(cookie\s*:\s*)[^\r\n]+")
 _COOKIE_KV_RE = re.compile(r"(?i)\b(Session_id|sessionid2|spravka|icookie|yandexuid|alice_uuid|ya24|_yasc|yp|ys|L|i)\s*(?:=|:)\s*[^;\s,]+")
-_DEVICE_RE = re.compile(r"(?i)\b(device_uuid|x-ya-device-id|x-ya-uuid)\s*[:=]\s*[^\s,;]+")
+_DEVICE_RE = re.compile(r"(?i)\b(uuid|client_uuid|device_uuid|x-ya-device-id|x-ya-uuid)\s*[:=]\s*[^\s,;]+")
 _URL_SECRET_NAMES = re.compile(r"token|secret|signature|sig|auth|cookie|session|password|key|fileguid|access", re.I)
 
 # Pull secret values from configured MCP environment blocks too. Those values
@@ -387,7 +387,7 @@ _TOKEN_RE = re.compile(r"y0_[A-Za-z0-9._~+/-]{3,}={0,2}")
 _HEADER_RE = re.compile(r"(?im)\b(authorization\s*:\s*(?:oauth|bearer)?\s*)[^\s,;]+")
 _COOKIE_RE = re.compile(r"(?im)\b(cookie\s*:\s*)[^\r\n]+")
 _COOKIE_KV_RE = re.compile(r"(?i)\b(Session_id|sessionid2|spravka|icookie|yandexuid|alice_uuid|ya24|_yasc|yp|ys|L|i)\s*(?:=|:)\s*[^;\s,]+")
-_SECRET_KEYS = re.compile(r"authorization|cookie|token|secret|password|credential|api.?key|icookie|session.?id|spravka|yandexuid|alice_uuid|device.?uuid|device.?id|file.?guid|signature|hf_token|hugging_face_hub_token", re.I)
+_SECRET_KEYS = re.compile(r"authorization|cookie|token|secret|password|credential|api.?key|icookie|session.?id|spravka|yandexuid|alice_uuid|uuid|uuid4|client_uuid|deviceUuid|deviceUUID|deviceId|device.?uuid|device.?id|file.?guid|signature|hf_token|hugging_face_hub_token", re.I)
 _SECRET_VALUES = []
 for _env_name in ("ALICE_TOKEN", "YANDEX_TOKEN", "ALICE_COOKIES", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
     _env_value = os.environ.get(_env_name, "")
@@ -1197,7 +1197,7 @@ def run_capture(args: argparse.Namespace) -> int:
     return 0 if exit_code == 0 else exit_code
 
 def redact_for_archive(value: Any, key: Optional[str] = None) -> Any:
-    if key and re.search(r"(^|[_-])(authorization|cookie|cookies|token|secret|password|credential|api_key|apikey|icookie|session_id|sessionid2|spravka|auth|device_uuid|hf_token|hugging_face_hub_token)([_-]|$)", key, re.I):
+    if key and re.search(r"(^|[_-])(authorization|cookie|cookies|token|secret|password|credential|api_key|apikey|icookie|session_id|sessionid2|spravka|auth|uuid|uuid4|client_uuid|deviceUuid|deviceUUID|deviceId|device_uuid|hf_token|hugging_face_hub_token)([_-]|$)", key, re.I):
         if key.lower() not in ("auth_type",):
             return "[REDACTED]"
     if isinstance(value, dict):

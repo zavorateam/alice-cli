@@ -213,6 +213,11 @@ class AliceWsEngine:
         self._running_task: Optional[asyncio.Task] = None
         self._active_agents_by_req: Dict[str, AliceAgent] = {}
         self._sync_event = asyncio.Event()
+        self._listener_task: Optional[asyncio.Task] = None
+        self._supervisor_task: Optional[asyncio.Task] = None
+        self._reconnect_lock = asyncio.Lock()
+        self._reconnect_backoff = 2.0
+        self._should_run = False
 
         self._upload_pending: Dict[str, asyncio.Queue] = {}
         self._upload_lock = asyncio.Lock()
@@ -311,7 +316,7 @@ class AliceWsEngine:
             ]
         return base
 
-    async def connect(self):
+    async def _open(self):
         headers = self.creds.build_ws_headers()
         sig = inspect.signature(websockets.connect)
         ws_kwargs: Dict[str, Any] = {"ping_interval": None}
@@ -321,13 +326,18 @@ class AliceWsEngine:
             ws_kwargs["additional_headers"] = headers
         else:
             ws_kwargs["extra_headers"] = headers
-
         self.ws = await websockets.connect(WEBSOCKET_URI, **ws_kwargs)
         self.is_connected = True
         self.seq_number = 0
         self._sync_event.clear()
-        self._running_task = asyncio.create_task(self._listen_loop())
 
+    async def start(self):
+        """Идемпотентный старт: ровно один listener + один supervisor."""
+        self._should_run = True
+        await self._open()
+        self._listener_task = asyncio.create_task(self._listen_loop(), name="alice-ws-listener")
+        self._running_task = self._listener_task
+        self._supervisor_task = asyncio.create_task(self._supervise(), name="alice-ws-supervisor")
         await self._synchronize_state()
         try:
             await asyncio.wait_for(self._sync_event.wait(), timeout=7.0)
@@ -336,15 +346,61 @@ class AliceWsEngine:
         except asyncio.TimeoutError:
             logger.warning("Таймаут SynchronizeStateResponse")
 
+    async def connect(self):
+        """Обратная совместимость: connect() == start()."""
+        await self.start()
+
+    async def _supervise(self):
+        """Единственный, кто переподключается. Reader запускается только здесь."""
+        while self._should_run:
+            if self.is_connected and self.ws is not None:
+                await asyncio.sleep(1.0)
+                continue
+            async with self._reconnect_lock:
+                if not self._should_run:
+                    return
+                try:
+                    await self._open()
+                    self._listener_task = asyncio.create_task(self._listen_loop(), name="alice-ws-listener")
+                    self._running_task = self._listener_task
+                    await self._synchronize_state()
+                    try:
+                        await asyncio.wait_for(self._sync_event.wait(), timeout=7.0)
+                        if self.verbose:
+                            logger.info(f"Сессия Uniproxy: {self.session_id}")
+                    except asyncio.TimeoutError:
+                        logger.warning("Таймаут SynchronizeStateResponse (reconnect)")
+                    await self._flush_subscriptions()
+                    self._reconnect_backoff = 2.0
+                    logger.info("WS reconnected")
+                except Exception as e:
+                    logger.warning(f"WS reconnect failed: {e!r}; retry in {self._reconnect_backoff}s")
+                    await asyncio.sleep(self._reconnect_backoff)
+                    self._reconnect_backoff = min(self._reconnect_backoff * 2, 30.0)
+
     async def disconnect(self):
+        self._should_run = False
         self.is_connected = False
-        if self._running_task:
-            self._running_task.cancel()
+        tasks = [
+            t for t in (self._listener_task, self._supervisor_task, self._running_task)
+            if t is not None and not t.done()
+        ]
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
         if self.ws:
             try:
                 await self.ws.close()
             except Exception:
                 pass
+        self.ws = None
+        self._listener_task = None
+        self._supervisor_task = None
+        self._running_task = None
 
     async def _send_json(self, data: dict):
         async with self._send_lock:
@@ -778,11 +834,15 @@ class AliceWsEngine:
                         accumulated_turns.pop(ref_id, None)
 
             except websockets.exceptions.ConnectionClosed:
-                await asyncio.sleep(2)
+                logger.warning("WS closed, listener exits — supervisor will reconnect")
+                self.is_connected = False
                 try:
-                    await self.connect()
+                    if self.ws is not None:
+                        await self.ws.close()
                 except Exception:
                     pass
+                self.ws = None
+                return
             except asyncio.CancelledError:
                 break
             except Exception as e:
