@@ -20,6 +20,7 @@ import aiohttp
 import websockets
 
 from agents import AgentWidget, AliceAgent, AliceTurnResponse, SuggestionAction, ThinkingStep, registry
+from tools.effective import EffectiveMode, normalize_effective_mode
 from agents.expert import ExpertAgent
 from alice_auth import (
     AliceCredentials,
@@ -221,6 +222,8 @@ class AliceWsEngine:
         self._full_content_dialogs: Set[str] = set()
         self._ping_dialogs: Set[str] = set()
         self._meeseeks_dialogs: Set[str] = set()
+        self.effective_by_req: Dict[str, EffectiveMode] = {}
+        self.requested_mode_by_req: Dict[str, str] = {}
 
         self.expert_trial_left: Optional[int] = None
         self.expert_trial_limit: Optional[int] = None
@@ -591,6 +594,8 @@ class AliceWsEngine:
         if attachments:
             payload["event"]["payload"]["request"]["attachments"] = attachments
 
+        self.requested_mode_by_req[req_id] = mode
+
         queue: asyncio.Queue = asyncio.Queue()
         self._pending_responses[req_id] = queue
         self._active_agents_by_req[req_id] = agent
@@ -606,6 +611,8 @@ class AliceWsEngine:
         try:
             while True:
                 resp = await asyncio.wait_for(queue.get(), timeout=agent.timeout)
+                if resp.is_finished:
+                    resp.effective = self.effective_by_req.get(req_id)
                 yield resp
                 if resp.is_finished:
                     break
@@ -617,6 +624,23 @@ class AliceWsEngine:
         finally:
             self._pending_responses.pop(req_id, None)
             self._active_agents_by_req.pop(req_id, None)
+
+    def _handle_vins_response(self, header: Dict[str, Any], payload: Dict[str, Any]) -> None:
+        ref_id = header.get("refMessageId") or header.get("ref_message_id")
+        if not ref_id:
+            logger.debug("VinsResponse без refMessageId — пропускаю")
+            return
+        requested = self.requested_mode_by_req.get(ref_id)
+        eff = normalize_effective_mode(payload, requested_mode=requested)
+        self.effective_by_req[ref_id] = eff
+        if eff.trial_left is not None:
+            self.expert_trial_left = eff.trial_left
+            self.expert_trial_limit = eff.trial_limit
+        logger.info(
+            "VinsResponse[%s] requested=%s effective=%s preset=%s src=%s degraded=%s",
+            ref_id[:8], eff.requested_mode, eff.effective_mode,
+            eff.effective_preset, eff.source_path, eff.degraded,
+        )
 
     def _update_trial_state(self, payload: Dict[str, Any]):
         eff = payload.get("alice_2_effective_settings") or {}
@@ -665,9 +689,7 @@ class AliceWsEngine:
                     continue
 
                 if name == "VinsResponse":
-                    payload = directive.get("payload", {})
-                    if "alice_2_effective_settings" in payload:
-                        self._update_trial_state(payload)
+                    self._handle_vins_response(header, directive.get("payload", {}))
                     continue
 
                 if name == "Upload" and ref_id in self._upload_pending:
@@ -1131,12 +1153,22 @@ async def main_async(args):
 
     if args.http:
         import uvicorn
+        from tools.gateway import ModelCatalog, attach_openai_routes
+        from tools.manager import SessionRegistry
+
+        async def _shared_factory():
+            return manager
+
         app = create_curl_http_app(manager)
+        catalog = ModelCatalog(manager_provider=lambda: manager)
+        session_registry = SessionRegistry(manager_factory=_shared_factory)
+        attach_openai_routes(app, catalog, session_registry)
         config = uvicorn.Config(app, host=args.host, port=args.port, log_level="warning")
         server = uvicorn.Server(config)
         try:
             await server.serve()
         finally:
+            await session_registry.close()
             if manager:
                 await manager.shutdown()
     else:

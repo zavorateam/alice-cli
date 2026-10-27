@@ -5,3 +5,5 @@ __pycache__
 agents/__pycache__
 token.txt
 alice_tools.json
+trace_exports
+.pytest_cache

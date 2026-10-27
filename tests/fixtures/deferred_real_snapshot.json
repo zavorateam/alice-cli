@@ -1,0 +1,27 @@
+[
+  {
+    "ref": "01a17dc6-5c9a",
+    "text": "1.",
+    "is_last": false
+  },
+  {
+    "ref": "01a17dc6-5c9a",
+    "text": "1. Hello, World!\n2.",
+    "is_last": false
+  },
+  {
+    "ref": "01a17dc6-5c9a",
+    "text": "1. Hello, World!\n2. Hello, World!",
+    "is_last": false
+  },
+  {
+    "ref": "01a17dc6-5c9a",
+    "text": "1. Hello, World!\n2. Hello, World!\n3. ",
+    "is_last": false
+  },
+  {
+    "ref": "01a17dc6-5c9a",
+    "text": "1. Hello, World!\n2. Hello, World!\n3. Hello, World!",
+    "is_last": true
+  }
+]

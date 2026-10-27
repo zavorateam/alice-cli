@@ -1,0 +1,20 @@
+{
+  "header": {
+    "refMessageId": "legacy-ref"
+  },
+  "payload": {
+    "alice_2_effective_settings": {
+      "mode": "External",
+      "trial_state": {
+        "left_count": 3,
+        "limit": 5
+      }
+    }
+  },
+  "_expected": {
+    "effective_mode": "External",
+    "source_path": "payload.alice_2_effective_settings",
+    "trial_left": 3,
+    "trial_limit": 5
+  }
+}

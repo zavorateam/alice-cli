@@ -1,0 +1,14 @@
+{
+  "header": {
+    "refMessageId": "no-eff"
+  },
+  "payload": {
+    "response": {
+      "cards": []
+    }
+  },
+  "_expected": {
+    "effective_mode": null,
+    "source_path": null
+  }
+}

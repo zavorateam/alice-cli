@@ -1,5 +1,4 @@
 websockets
-asyncio
 aioconsole
 fastapi
 uvicorn

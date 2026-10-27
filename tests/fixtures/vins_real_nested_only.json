@@ -1,0 +1,30 @@
+{
+  "header": {
+    "refMessageId": "01a17dc2-0996-760c-a51b-46311a20991e"
+  },
+  "payload": {
+    "counteractivation_features": {
+      "scenario_features": {
+        "is_general_conversation": true
+      }
+    },
+    "header": {
+      "response_id": "r1",
+      "ref_message_id": "01a17dc2-0996-760c-a51b-46311a20991e"
+    },
+    "response": {
+      "alice_2_effective_settings": {
+        "effective_settings": {
+          "mode": "Base"
+        }
+      },
+      "directives": [],
+      "is_streaming": true,
+      "cards": []
+    }
+  },
+  "_expected": {
+    "effective_mode": "Base",
+    "source_path": "payload.response.alice_2_effective_settings"
+  }
+}

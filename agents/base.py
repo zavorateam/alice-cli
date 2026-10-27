@@ -65,6 +65,7 @@ class AliceTurnResponse:
     sources: List[Dict[str, Any]] = field(default_factory=list)
     is_finished: bool = False
     error: Optional[str] = None
+    effective: Optional[Any] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -78,6 +79,7 @@ class AliceTurnResponse:
             "sources": self.sources,
             "is_finished": self.is_finished,
             "error": self.error,
+            "effective": (self.effective.to_dict() if hasattr(self.effective, "to_dict") else self.effective),
         }
     model_dump = to_dict
 

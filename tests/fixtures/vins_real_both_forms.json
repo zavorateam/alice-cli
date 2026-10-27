@@ -1,0 +1,22 @@
+{
+  "header": {
+    "refMessageId": "01a17dc6-5007-7868-bfe0-0470117a3b0f"
+  },
+  "payload": {
+    "effective_alice_2_settings": {
+      "mode": "Base"
+    },
+    "response": {
+      "alice_2_effective_settings": {
+        "effective_settings": {
+          "mode": "Base"
+        }
+      },
+      "cards": []
+    }
+  },
+  "_expected": {
+    "effective_mode": "Base",
+    "source_path": "payload.effective_alice_2_settings"
+  }
+}

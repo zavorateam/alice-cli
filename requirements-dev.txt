@@ -1,0 +1,3 @@
+-r requirements.txt
+pytest>=9
+httpx2>=2.0  # starlette>=1.2 TestClient transport

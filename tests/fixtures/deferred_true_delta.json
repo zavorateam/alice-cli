@@ -1,0 +1,17 @@
+[
+  {
+    "ref": "synth",
+    "text": "Hel",
+    "is_last": false
+  },
+  {
+    "ref": "synth",
+    "text": "lo",
+    "is_last": false
+  },
+  {
+    "ref": "synth",
+    "text": " world",
+    "is_last": true
+  }
+]
