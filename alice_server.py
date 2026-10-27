@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Alice AI Unified Server.
-Парсит neuro_structured_blocks_card: Markdown → ответ, ReasoningSummary → thinking_steps.
 """
 
 import argparse
@@ -21,6 +20,7 @@ import aiohttp
 import websockets
 
 from agents import AgentWidget, AliceAgent, AliceTurnResponse, SuggestionAction, ThinkingStep, registry
+from agents.expert import ExpertAgent
 from alice_auth import (
     AliceCredentials,
     load_or_request_credentials,
@@ -31,45 +31,50 @@ from alice_auth import (
 WEBSOCKET_URI = "wss://uniproxy.alice.yandex.ru/uni.ws"
 RPC_BASE_URL = "https://rpc.alice.yandex.ru"
 ORIGIN = "https://alice.yandex.ru"
+
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:158.0) Gecko/20100101 Firefox/158.0"
+TEXTINPUT_UA = "Mozilla/5.0"
 
 DEFAULT_EXPERIMENTS = [
-    "dont_skip_cancel_requests", "enable_parallel_requests_to_chats",
-    "read_dialogs_for_unauthorized_users", "mm_allow_anonymous_request",
-    "enable_external_skills_for_webdesktop_and_webtouch",
-    "send_show_view_directive_on_supports_show_view_layer_content_interface",
-    "standalone_alice_2_0", "mm_enable_protocol_scenario=WebAliceControls",
-    "exp_flag_chat_dialog_history", "exp_flag_chat_dialog_history_main_context_save",
-    "div2cards_in_external_skills_for_web_standalone", "enable_find_poi_standalone",
-    "use_server_pings", "enable_onboarding_adaptive_size",
-    "standalone_show_fullscreen_image_gallery_directive",
-    "draw_picture_enable_controls", "alice_has_borders_div_paddings",
-    "enable_new_colors_for_alice_chat",
+    "dont_skip_cancel_requests",
+    "enable_parallel_requests_to_chats",
+    "standalone_alice_2_0",
+    "mm_enable_protocol_scenario=WebAliceControls",
+    "exp_flag_chat_dialog_history",
+    "exp_flag_chat_dialog_history_main_context_save",
+    "div2cards_in_external_skills_for_web_standalone",
+    "use_server_pings",
     "erase_serialized_response_from_json_deferred_alice_response",
-    "skills_standalone_use_div_render", "standalone_skill_card_cloud_ui",
+    "skills_standalone_use_div_render",
+    "standalone_skill_card_cloud_ui",
 ]
 
 DEFAULT_SUPPORTED_FEATURES = [
-    "background_response_streaming_for_dialog_controls",
-    "background_response_streaming_in_read_dialog",
-    "background_response_streaming", "background_response_streaming_anon",
-    "supports_bso_answer", "open_link", "server_action", "show_promo",
-    "reminders_and_todos", "div2_cards", "player_pause_directive",
-    "can_open_dialogs_in_tabs", "supports_streaming_response",
-    "supports_rich_json_cards", "builtin_reaction", "open_link_by_button",
-    "supports_origin_in_separate_card", "supports_new_sources_cards",
-    "supports_markdown_response", "supported_save_chathistory",
-    "supported_load_chathistory", "supports_unlimited_dialogs_creation",
-    "supports_multi_model_dialogs", "print_text_in_message_view",
-    "show_loader_directive", "supports_stringbody_in_div2_card",
-    "supports_default_dialog_as_dedicated", "whisper",
+    "background_response_streaming",
+    "supports_bso_answer",
+    "open_link",
+    "server_action",
+    "div2_cards",
+    "supports_streaming_response",
+    "supports_rich_json_cards",
+    "supports_markdown_response",
+    "supported_save_chathistory",
+    "supports_multi_model_dialogs",
+    "print_text_in_message_view",
+    "supports_unlimited_dialogs_creation",
+    "supports_default_dialog_as_dedicated",
 ]
+
+_FRAME_SEQ: Dict[Tuple[str, str], int] = {
+    ("System", "SynchronizeState"): 1,
+    ("System", "ClientSubscriptionState"): 2,
+    ("Vins", "TextInput"): 3,
+}
 
 logger = logging.getLogger("alice_server")
 
 
 def uuid7() -> str:
-    """RFC 9562 UUIDv7 — совместим с форматом dialog_id и messageId Яндекса."""
     ms = int(time.time() * 1000)
     b = bytearray(ms.to_bytes(6, "big") + os.urandom(10))
     b[6] = (b[6] & 0x0F) | 0x70
@@ -220,6 +225,89 @@ class AliceWsEngine:
         self.expert_trial_left: Optional[int] = None
         self.expert_trial_limit: Optional[int] = None
 
+    def _icookie(self) -> str:
+        cookies = getattr(self.creds, "cookie_dict", None) or {}
+        ic = ""
+        if isinstance(cookies, dict):
+            ic = cookies.get("i", "") or ""
+        return ic or (getattr(self.creds, "icookie", "") or "")
+
+    def _resolve_experiments(self, agent: AliceAgent) -> List[str]:
+        fn = getattr(agent, "build_experiments", None)
+        if callable(fn):
+            try:
+                result = list(fn())
+                if result:
+                    return result
+            except Exception as e:
+                logger.warning(f"{agent.id}.build_experiments(): {e}")
+        return list(DEFAULT_EXPERIMENTS)
+
+    def _resolve_supported_features(self, agent: AliceAgent) -> List[str]:
+        fn = getattr(agent, "build_supported_features", None)
+        if callable(fn):
+            try:
+                result = list(fn())
+                if result:
+                    return result
+            except Exception as e:
+                logger.warning(f"{agent.id}.build_supported_features(): {e}")
+        return list(DEFAULT_SUPPORTED_FEATURES)
+
+    def _resolve_capabilities(self, agent: AliceAgent, dialog_id: str) -> List[Dict[str, Any]]:
+        preset = getattr(agent, "preset", "") or ""
+        mode = getattr(agent, "mode", "") or "Pro"
+        if agent.id == "expert":
+            preset = "agents_RnServiceAliceExpert"
+            mode = "External"
+
+        try:
+            base = list(agent.build_capabilities(dialog_id, self.creds.device_uuid) or [])
+        except Exception as e:
+            logger.warning(f"{agent.id}.build_capabilities(): {e}")
+            base = []
+
+        if agent.id == "expert" and base:
+            return base
+
+        required_state = {
+            "navigation_state": {"topmost_navigation_entry": {
+                "id": "chat", "type": "Chat",
+                "title": "Чат с Алисой", "can_navigate_back": False,
+            }},
+            "active_chat_dialog_context": {
+                "dialog_id": dialog_id,
+                "dialog_type": "DEDICATED_CHAT",
+                "alice2_mode_info": {"preset": preset, "mode": mode},
+            },
+        }
+        for cap in base:
+            if "TAliceChatCapability" in cap.get("@type", ""):
+                cap.setdefault("state", {})
+                for key, val in required_state.items():
+                    cap["state"].setdefault(key, val)
+
+        if not base:
+            base = [
+                {"@type": "type.googleapis.com/NAlice.TAliceCapability",
+                 "meta": {}, "parameters": {}, "state": {}},
+                {
+                    "@type": "type.googleapis.com/NAlice.TAliceChatCapability",
+                    "meta": {"supported_directives": [
+                        "SetChatRequestModeDirectiveType",
+                        "ShowNotificationDirectiveType",
+                        "CreateNewChatDirectiveType",
+                    ]},
+                    "parameters": {
+                        "supports_rich_answers": True,
+                        "supports_rich_suggests": True,
+                        "supports_rich_summary": True,
+                    },
+                    "state": required_state,
+                },
+            ]
+        return base
+
     async def connect(self):
         headers = self.creds.build_ws_headers()
         sig = inspect.signature(websockets.connect)
@@ -259,9 +347,11 @@ class AliceWsEngine:
         async with self._send_lock:
             if not self.ws or not self.is_connected:
                 raise ConnectionError("WebSocket не подключен")
-            self.seq_number += 1
             if "event" in data and "header" in data["event"]:
-                data["event"]["header"]["seqNumber"] = self.seq_number
+                h = data["event"]["header"]
+                key = (h.get("namespace"), h.get("name"))
+                if key in _FRAME_SEQ:
+                    h["seqNumber"] = _FRAME_SEQ[key]
             await self.ws.send(json.dumps(data, ensure_ascii=False))
 
     async def _synchronize_state(self):
@@ -270,7 +360,7 @@ class AliceWsEngine:
             "event": {
                 "header": {
                     "namespace": "System", "name": "SynchronizeState",
-                    "seqNumber": 1, "messageId": msg_id,
+                    "messageId": msg_id,
                 },
                 "payload": {
                     "auth_token": self.creds.get_ws_auth_token(),
@@ -286,7 +376,7 @@ class AliceWsEngine:
                     "supported_features": DEFAULT_SUPPORTED_FEATURES,
                     "request": {"experiments": DEFAULT_EXPERIMENTS},
                     "speechkitVersion": "4.16.7",
-                    "icookie": self.creds.icookie,
+                    "icookie": self._icookie(),
                     "client_analytics_info": {"client_url": "https://alice.yandex.ru/chat/"},
                 },
             }
@@ -428,62 +518,19 @@ class AliceWsEngine:
             finally:
                 self._upload_pending.pop(message_id, None)
 
-    @staticmethod
-    def _inject_chat_context(
-        capabilities: List[Dict[str, Any]],
-        dialog_id: str,
-        agent: AliceAgent,
-    ) -> List[Dict[str, Any]]:
-        chat_ctx = {
-            "dialog_id": dialog_id,
-            "dialog_type": "DEDICATED_CHAT",
-            "alice2_mode_info": {
-                "preset": getattr(agent, "preset", "") or "",
-                "mode": getattr(agent, "mode", "") or "Pro",
-            },
-        }
-        for cap in capabilities:
-            if isinstance(cap, dict) and str(cap.get("@type", "")).endswith("TAliceChatCapability"):
-                state = cap.setdefault("state", {})
-                if isinstance(state, dict):
-                    state["active_chat_dialog_context"] = chat_ctx
-                    return capabilities
-        capabilities.append({
-            "@type": "type.googleapis.com/NAlice.TAliceChatCapability",
-            "meta": {
-                "supported_directives": [
-                    "ScrollToFragmentDirectiveType",
-                    "LoginWithCallbackDirectiveType",
-                    "ShowBannerDirectiveType",
-                    "ShowNotificationDirectiveType",
-                    "SetChatRequestModeDirectiveType",
-                    "ShowFullscreenImageGalleryDirectiveType",
-                    "DownloadImageDirectiveType",
-                    "FillChatInputDirectiveType",
-                    "CreateNewChatDirectiveType",
-                    "OpenChatListDirectiveType",
-                    "ChatNavigateBackDirectiveType",
-                ]
-            },
-            "parameters": {
-                "supports_rich_answers": True,
-                "supports_rich_suggests": True,
-                "supports_rich_summary": True,
-            },
-            "state": {
-                "active_chat_dialog_context": chat_ctx,
-            },
-        })
-        return capabilities
-
     async def send_text_input(
         self, text: str, dialog_id: str, agent: AliceAgent,
         prev_req_id: Optional[str] = None, is_suggest: bool = False,
         attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> AsyncGenerator[AliceTurnResponse, None]:
         req_id = uuid7()
-        capabilities = agent.build_capabilities(dialog_id, self.creds.device_uuid)
-        capabilities = self._inject_chat_context(capabilities, dialog_id, agent)
+
+        capabilities = self._resolve_capabilities(agent, dialog_id)
+        experiments = self._resolve_experiments(agent)
+        supported_features = self._resolve_supported_features(agent)
+
+        preset = "agents_RnServiceAliceExpert" if agent.id == "expert" else agent.preset
+        mode = "External" if agent.id == "expert" else agent.mode
 
         header_dict: Dict[str, Any] = {
             "request_id": req_id, "dialog_id": dialog_id, "dialog_type": 2,
@@ -495,13 +542,15 @@ class AliceWsEngine:
 
         payload = {
             "event": {
-                "header": {"namespace": "Vins", "name": "TextInput",
-                           "messageId": req_id, "seqNumber": self.seq_number + 1},
+                "header": {
+                    "namespace": "Vins", "name": "TextInput",
+                    "messageId": req_id,
+                },
                 "payload": {
                     "application": {
                         "app_id": "ru.yandex.webstandalone.desktop",
                         "app_version": "unknown", "platform": "linux",
-                        "os_version": USER_AGENT.lower(),
+                        "os_version": TEXTINPUT_UA.lower(),
                         "uuid": self.creds.device_uuid,
                         "device_id": self.creds.device_uuid,
                         "lang": "ru-RU",
@@ -513,18 +562,18 @@ class AliceWsEngine:
                     "request": {
                         "event": {"type": event_type, "text": text},
                         "voice_session": False,
-                        "experiments": DEFAULT_EXPERIMENTS,
+                        "experiments": experiments,
                         "uniproxy_options": {
                             "background_response_streaming_options": {
                                 "request_with_shown_new_dialog": {}
                             }
                         },
                         "additional_options": {
-                            "bass_options": {"user_agent": USER_AGENT, "screen_scale_factor": 1},
+                            "bass_options": {"user_agent": TEXTINPUT_UA, "screen_scale_factor": 1},
                             "origin_domain": "yandex.ru",
-                            "supported_features": DEFAULT_SUPPORTED_FEATURES,
+                            "supported_features": supported_features,
                             "unsupported_features": [],
-                            "icookie": self.creds.icookie,
+                            "icookie": self._icookie(),
                         },
                         "environment_state": {"endpoints": [
                             {"id": self.creds.device_uuid, "capabilities": capabilities}
@@ -534,7 +583,7 @@ class AliceWsEngine:
                     "mime": "audio/ogg;codecs=opus",
                     "topic": "desktopgeneral",
                     "punctuation": False,
-                    "alice_2_settings": {"preset": agent.preset, "mode": agent.mode},
+                    "alice_2_settings": {"preset": preset, "mode": mode},
                 },
             }
         }
@@ -545,6 +594,12 @@ class AliceWsEngine:
         queue: asyncio.Queue = asyncio.Queue()
         self._pending_responses[req_id] = queue
         self._active_agents_by_req[req_id] = agent
+
+        logger.info(
+            f"TEXTINPUT preset={preset!r} mode={mode!r} "
+            f"agent={agent.__class__.__name__} "
+            f"caps={len(capabilities)} exp={len(experiments)} feat={len(supported_features)}"
+        )
 
         await self._send_json(payload)
 
@@ -596,7 +651,12 @@ class AliceWsEngine:
                         "messageId": uuid7(),
                         "refMessageId": header.get("messageId"),
                     }, "payload": {}}}
-                    await self._send_json(pong)
+                    try:
+                        if self.ws and self.is_connected:
+                            async with self._send_lock:
+                                await self.ws.send(json.dumps(pong, ensure_ascii=False))
+                    except Exception:
+                        pass
                     continue
 
                 if name == "SynchronizeStateResponse":
@@ -640,10 +700,26 @@ class AliceWsEngine:
 
                     for card in cards:
                         answer_text, thinking_steps, sources = _parse_nsb_card(card)
-                        if thinking_steps:
-                            turn.thinking_steps = thinking_steps
-                        if sources:
-                            turn.sources = sources
+
+                        # ACCUMULATE: reasoning приходит по кусочкам, каждый
+                        # DeferredAliceResponse содержит лишь часть. Раньше
+                        # turn.thinking_steps перезаписывались — в итоге в CLI
+                        # попадал только последний блок.
+                        for step in thinking_steps:
+                            if not any(
+                                s.kind == step.kind
+                                and s.title == step.title
+                                and s.content == step.content
+                                and s.tool == step.tool
+                                for s in turn.thinking_steps
+                            ):
+                                turn.thinking_steps.append(step)
+
+                        # ACCUMULATE: источники — аналогично.
+                        for src in sources:
+                            if src not in turn.sources:
+                                turn.sources.append(src)
+
                         if answer_text and answer_text not in text_blocks:
                             text_blocks.append(answer_text)
                         if answer_text or thinking_steps:
@@ -706,20 +782,34 @@ class AliceAgentManager:
         self.ephemeral_dialogs: Set[str] = set()
 
     async def initialize(self, initial_dialog_id: Optional[str] = None):
+        if not registry._agents.get("expert"):
+            registry.register(ExpertAgent())
+            logger.info("Registered ExpertAgent (preset=agents_RnServiceAliceExpert)")
+
+        try:
+            registry.auto_discover()
+        except Exception as e:
+            logger.warning(f"auto_discover: {e}")
+
         status, apps, _ = await self.rpc.get_alice_apps()
         if status == 200:
             for app in apps:
                 app_id_val = app.get("app_id")
                 app_name_val = app.get("name", "")
-                if app_id_val:
-                    existing = registry.get(app_id_val)
-                    if not existing or existing.id == "pro":
-                        registry.register(GenericAppAgent(
-                            app_id=app_id_val,
-                            name=app_name_val or "Приложение",
-                            aliases=[app_name_val.lower()] if app_name_val else [],
-                            description=app.get("description", ""),
-                        ))
+                if not app_id_val:
+                    continue
+                if registry._agents.get(app_id_val):
+                    continue
+                registry.register(GenericAppAgent(
+                    app_id=app_id_val,
+                    name=app_name_val or "Приложение",
+                    aliases=[app_name_val.lower()] if app_name_val else [],
+                    description=app.get("description", ""),
+                ))
+
+        experts = [a for a in registry.list_all() if a.id == "expert"]
+        for e in experts:
+            logger.info(f"agent 'expert' -> {e.__class__.__name__} preset={e.preset!r} mode={e.mode!r}")
 
         await self.ws.connect()
         _, recent_dialogs, _ = await self.rpc.list_dialogs(limit=5)
@@ -733,6 +823,20 @@ class AliceAgentManager:
         if initial_dialog_id:
             self.active_dialog_id = initial_dialog_id
             self.known_dialogs.add(initial_dialog_id)
+            try:
+                async with aiohttp.ClientSession(headers=self.creds.build_rpc_headers()) as session:
+                    async with session.post(
+                        f"{RPC_BASE_URL}/dialog/read_dialog",
+                        json={"dialog_id": initial_dialog_id, "ts_max_ms": 9007199254740991, "limit": 20}
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            msgs = data.get("messages", [])
+                            if msgs:
+                                self.dialog_prev_req_ids[initial_dialog_id] = msgs[-1].get("request_id")
+                                logger.info(f"Подтянут prev_req_id для {initial_dialog_id}: {msgs[-1].get('request_id')}")
+            except Exception as e:
+                logger.warning(f"Не удалось получить prev_req_id: {e}")
 
         if not self.active_dialog_id:
             self.active_dialog_id = uuid7()
@@ -749,7 +853,9 @@ class AliceAgentManager:
         self.dialog_prev_req_ids[new_id] = None
         if is_ephemeral:
             self.ephemeral_dialogs.add(new_id)
+
         await self.ws.update_subscriptions(new_id, self.known_dialogs)
+        await asyncio.sleep(1.0)
         return new_id
 
     async def cleanup_ephemeral_dialogs(self):
@@ -914,7 +1020,7 @@ class AliceMcpServer:
                     res = {"jsonrpc": "2.0", "id": req_id, "result": {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "yandex-alice-server", "version": "4.5.0"},
+                        "serverInfo": {"name": "yandex-alice-server", "version": "4.6.0"},
                     }}
                 elif method == "notifications/initialized":
                     continue
@@ -970,6 +1076,29 @@ def create_curl_http_app(manager: Optional[AliceAgentManager]):
     return app
 
 
+def _log_session_hint(creds: AliceCredentials):
+    cookie_dict = getattr(creds, "cookie_dict", None) or {}
+    sess_id = cookie_dict.get("Session_id", "") if isinstance(cookie_dict, dict) else ""
+    yuid = cookie_dict.get("yandexuid", "") if isinstance(cookie_dict, dict) else ""
+    oauth_uuid = getattr(creds, "device_uuid", "<none>")
+
+    if sess_id:
+        logger.info(f"Cookie.Session_id : {sess_id[:50]}…")
+    else:
+        logger.warning("Cookie.Session_id отсутствует — /dialog/get_objects вернёт 404")
+
+    if yuid:
+        u_clean = oauth_uuid.lstrip("0") if isinstance(oauth_uuid, str) else ""
+        if yuid != u_clean:
+            logger.warning(f"Cookie.yandexuid ({yuid}) != OAuth UUID ({u_clean})")
+            logger.warning("   → Session_id почти наверняка от другого аккаунта.")
+            logger.warning("   → get_objects вернёт 404 (чат создастся, но невидим).")
+            logger.warning("   → Пере-экспортируйте cookie из браузера, залогиненного")
+            logger.warning("     под тем же аккаунтом, что OAuth-токен.")
+
+    logger.info(f"OAuth UUID        : {oauth_uuid}")
+
+
 async def main_async(args):
     is_mcp = not args.http
     allow_interactive = not is_mcp and sys.stdin.isatty()
@@ -989,6 +1118,7 @@ async def main_async(args):
                 sys.exit(1)
         else:
             logger.info(f"✓ {msg}")
+            _log_session_hint(creds)
             manager = AliceAgentManager(creds, verbose=args.verbose,
                                         show_thinking=getattr(args, "thinking", False))
             await manager.initialize()

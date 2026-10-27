@@ -1,19 +1,34 @@
 {
   "shell": {
     "enabled": true,
-    "strict": true,
-    "allowed_commands": [
-      "ls", "cat", "head", "tail", "wc", "grep", "find",
-      "pwd", "date", "echo", "whoami", "uname", "file", "stat",
-      "du", "df", "tree", "python3", "pip"
+    "strict": false,
+    "blocked_commands": [
+      "rm", "mv", "sudo", "su", "dd", "mkfs",
+      "chmod", "chown", "chattr", "chgrp",
+      "kill", "killall", "pkill",
+      "shutdown", "reboot", "halt", "init",
+      "systemctl", "launchctl",
+      "passwd", "useradd", "userdel", "usermod",
+      "iptables", "pfctl", "mount", "umount"
     ],
     "working_directory": "/tmp",
-    "timeout_sec": 15
+    "timeout_sec": 120
   },
   "files": {
-    "root": "/home",
+    "root": "~",
     "read_enabled": true,
-    "list_enabled": true
+    "list_enabled": true,
+    "attach_enabled": true,
+    "attach_max_bytes": 20971520,
+    "write_enabled": true,
+    "write_root": "~",
+    "write_max_bytes": 10485760
+  },
+  "meeseeks": {
+    "enabled": true,
+    "max_depth": 3,
+    "max_concurrent": 5,
+    "bridge_max_iterations": 8
   },
   "mcpServers": {
     "fetch": {

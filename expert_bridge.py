@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 """
-ExpertBridge — Expert через JSON-контракт (v5.1).
-
-Схема:
-  1. Отправляем чистый контракт (одобрен Expert в веб-чате).
-  2. Expert принимает контракт и использует JSON для shell/write_file.
-  3. Если Expert делает файлы через свой python_interpreter, мы ловим FileGuid.
-  4. Скачиваем каскадом: HTTP -> Playwright (через клик в веб-интерфейсе).
+ExpertBridge — Expert через JSON-контракт (v5.3).
 """
 
 import asyncio
@@ -22,7 +16,7 @@ import yarl
 
 from agents.base import AliceTurnResponse
 from alice_server import AliceAgentManager
-from local_tools import LocalToolRegistry
+from local_tools import LocalToolRegistry, DownloadAttachmentTool
 
 try:
     from playwright.async_api import async_playwright
@@ -32,7 +26,6 @@ except ImportError:
 
 logger = logging.getLogger("expert_bridge")
 
-# Fallback-парсеры
 RE_TAG = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL | re.IGNORECASE)
 RE_FENCED_JSON = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
 RE_KV = re.compile(
@@ -42,7 +35,6 @@ RE_KV = re.compile(
 RE_DOLLAR = re.compile(r"^\s*\$\s+(.+?)\s*$", re.MULTILINE)
 RE_INLINE_CODE = re.compile(r"`[^`\n]+`")
 
-# FileGuid и S3-ссылки
 RE_FILEGUID = re.compile(
     r'https://rpc\.alice\.yandex\.ru/gproxy/get_source_file\?FileGuid=([a-f0-9-]+)',
     re.IGNORECASE,
@@ -66,7 +58,7 @@ class ExpertBridge:
         tools: LocalToolRegistry,
         agent_id: str = "expert",
         download_dir: str = DEFAULT_DOWNLOAD_DIR,
-        auto_download: bool = True,
+        auto_download: bool = False,
         max_iterations: int = 8,
         approve_callback=None,
         show_thinking: bool = False,
@@ -82,6 +74,15 @@ class ExpertBridge:
 
         os.makedirs(self.download_dir, exist_ok=True)
         self._contract_established: set = set()
+        self._download_context: Dict[str, Optional[str]] = {"dialog_id": None}
+
+        if "download_attachment" not in self.tools.tools:
+            async def _dl(url: str, filename: Optional[str]):
+                return await self._download(
+                    url, filename,
+                    dialog_id=self._download_context.get("dialog_id"),
+                )
+            self.tools.register(DownloadAttachmentTool(downloader=_dl))
 
     # ---------- contract ----------
 
@@ -91,12 +92,29 @@ class ExpertBridge:
             "",
             "ФОРМАТ — один из двух:",
             "",
-            "1. Нужна моя машина (локальный shell, запись файлов на мой диск) → верни ТОЛЬКО JSON, без пояснений до и после, без markdown:",
+            "1. Нужна моя машина (локальный shell, запись файлов на мой диск, скачивание файлов) → верни ТОЛЬКО JSON, без пояснений до и после, без markdown:",
             '{"tool": "shell", "args": {"cmd": "uname -a"}}',
             "",
-            "2. Не нужна моя машина (интернет, Python, файлы, OCR, обычный разговор) → отвечай как всегда.",
+            "2. Не нужна моя машина (интернет, Python, файлы в песочнице, OCR, обычный разговор) → отвечай как всегда.",
             "",
-            "Если в сообщении есть JSON — в нём НЕТ НИЧЕГО другого. Ни «сейчас проверю», ни объяснений.",
+            "ФОРМАТ ОТВЕТА С ИНСТРУМЕНТОМ (важно):",
+            "1. Одна короткая строка — что собираешься делать (5-15 слов). Без markdown.",
+            "2. На следующей строке — JSON-вызов.",
+            "3. Несколько инструментов подряд — по строке-описанию на каждый.",
+            "4. Финальный ответ (без инструментов) — обычный текст, без JSON.",
+            "",
+            "Пример:",
+            "Проверю систему и количество ядер.",
+            '{"tool": "shell", "args": {"cmd": "uname -a; nproc"}}',
+            "",
+            "Соберу данные по всем препаратам параллельно.",
+            '{"tool": "meeseeks_batch", "args": {"tasks": ["expert: ...", "expert: ..."]}}',
+            "",
+            "По результатам: <обычный финальный ответ>",
+            "",
+            "Без ```json-блоков, без комментариев после JSON, без пояснений в той же строке.",
+            "",
+            "Если в сообщении есть JSON — в нём НЕТ НИЧЕГО другого, кроме строки-описания над ним.",
             "",
             "ПРАВИЛА:",
             "1. Read-only по умолчанию. ls, cat, uname, df, pwd, head, tail, wc, file, stat, which, id, date, uptime, ps, du, nproc — без объяснений.",
@@ -104,21 +122,24 @@ class ExpertBridge:
             "3. Секреты — никогда. Пароли, токены, ключи, .env, .ssh, cookies.",
             "4. Сомневаешься — спроси словами, не стреляй JSON вслепую.",
             "",
-            "Опасное (rm, mv, sudo) заблокировано на моей стороне — даже если ты пришлёшь, оно не выполнится. Так что не бойся предлагать.",
+            "Опасное (rm, mv, sudo) заблокировано на моей стороне — даже если ты пришлёшь, оно не выполнится.",
             "",
             "ПАЙПЫ — ЯВНО РАЗРЕШЕНЫ. И даже приветствуются.",
             "head, tail, grep, wc, sort, awk, sed, cut, uniq, xargs — используй смело.",
-            "  uname -a | head -3 — нормально.",
-            "  lscpu | grep -E 'Core|Socket' — нормально.",
-            "  ps aux | grep node | wc -l — нормально.",
-            "  df -h | sort -k5 -hr | head -5 — нормально.",
-            "  uname -a; echo '---'; nproc — тоже нормально.",
             "",
             "ПРО write_file — ОСОБО ВАЖНО:",
             "Это НЕ shell-команда. Это «сохрани мой же текст в файл».",
             "Не `echo > file`, не `tee`, не `printf >`.",
-            "Для любой записи файла используй именно:",
             '{"tool": "write_file", "args": {"path": "~/Downloads/test.json", "content": "{\\"hello\\":\\"world\\"}"}}',
+            "",
+            "ПРО download_attachment — ОСОБО ВАЖНО:",
+            "Если создала файл у себя (xlsx, csv, pdf, docx, png, zip...) и хочешь отдать на мой диск —",
+            "НЕ вставляй просто markdown-ссылку (я её вслепую не скачиваю). Верни JSON-вызов:",
+            '{"tool": "download_attachment", "args": {"file_guid": "34a2270-...", "filename": "cbr_rates.xlsx"}}',
+            "",
+            "FileGuid — uuid из https://rpc.alice.yandex.ru/gproxy/get_source_file?FileGuid=<uuid>.",
+            'Можно также передать "url" вместо file_guid.',
+            "Файл сохранится в ~/Downloads. Получишь ответ «Сохранено: /путь (N байт)».",
             "",
             "ДОСТУПНЫЕ TOOLS:",
         ]
@@ -154,8 +175,7 @@ class ExpertBridge:
             if isinstance(obj, dict):
                 name = obj.get("tool") or obj.get("name") or obj.get("action")
                 args = obj.get("args") or obj.get("arguments") or obj.get("params") or {}
-                
-                # Фикс: Expert иногда присылает "command" вместо "cmd"
+
                 if name == "shell" and isinstance(args, dict):
                     if "command" in args and "cmd" not in args:
                         args["cmd"] = args["command"]
@@ -221,8 +241,11 @@ class ExpertBridge:
                 parsed = arg
             if name == "shell" and isinstance(parsed, str):
                 parsed = {"cmd": parsed}
-            elif name in ("read_file", "list_dir", "attach_file") and isinstance(parsed, str):
-                parsed = {"path": parsed}
+            elif name in ("read_file", "list_dir", "attach_file", "download_attachment") and isinstance(parsed, str):
+                if name == "download_attachment":
+                    parsed = {"file_guid": parsed}
+                else:
+                    parsed = {"path": parsed}
             elif name == "meeseeks" and isinstance(parsed, str):
                 if ":" in parsed:
                     ag, task = parsed.split(":", 1)
@@ -233,6 +256,48 @@ class ExpertBridge:
                 parsed = {"tasks": [t.strip() for t in parsed.split("|") if t.strip()]}
             kv_calls.append({"tool": name, "args": parsed})
         return kv_calls
+
+    def _extract_label_and_calls(self, text: str) -> Tuple[str, List[Dict]]:
+        """
+        Разделяет ответ на (label, calls).
+        label = последняя непустая строка до первого JSON-вызова
+                (то, что Expert написал как «сейчас сделаю X»).
+        """
+        if not text:
+            return "", []
+
+        decoder = json.JSONDecoder()
+        calls: List[Dict] = []
+        first_json_start: Optional[int] = None
+        i, n = 0, len(text)
+
+        while i < n:
+            if text[i] == '{':
+                try:
+                    obj, end = decoder.raw_decode(text[i:])
+                    if isinstance(obj, dict):
+                        name = obj.get("tool") or obj.get("name") or obj.get("action")
+                        args = obj.get("args") or obj.get("arguments") or obj.get("params") or {}
+                        if name and isinstance(name, str):
+                            if name == "shell" and isinstance(args, dict) \
+                                    and "command" in args and "cmd" not in args:
+                                args["cmd"] = args["command"]
+                            if first_json_start is None:
+                                first_json_start = i
+                            calls.append({"tool": name, "args": args})
+                            i += end
+                            continue
+                except json.JSONDecodeError:
+                    pass
+            i += 1
+
+        if calls and first_json_start is not None:
+            prefix = text[:first_json_start].strip()
+            lines = [ln.rstrip() for ln in prefix.splitlines() if ln.strip()]
+            label = lines[-1] if lines else ""
+            return label, calls
+
+        return "", self._parse_calls(text)
 
     # ---------- downloads ----------
 
@@ -254,18 +319,16 @@ class ExpertBridge:
         return ct_map.get(ct.split(";")[0].strip(), "")
 
     async def _download_via_browser(self, url: str, filename: Optional[str] = None, dialog_id: Optional[str] = None) -> Optional[str]:
-        """Fallback: скачивание через UI-клик в headless Chromium."""
         if not PLAYWRIGHT_AVAILABLE:
             logger.warning("Playwright не установлен (pip install playwright && playwright install chromium).")
             return None
 
         logger.info(f"Запускаю Playwright для скачивания (UI-клик): {url[:80]}...")
-        
+
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context(ignore_https_errors=True)
-            
-            # Безопасная установка cookies
+
             pw_cookies = []
             for k, v in self.manager.creds.cookie_dict.items():
                 if not k or not v:
@@ -275,11 +338,11 @@ class ExpertBridge:
                 if not k_clean or not v_clean:
                     continue
                 pw_cookies.append({
-                    "name": k_clean, 
+                    "name": k_clean,
                     "value": v_clean,
                     "url": "https://yandex.ru"
                 })
-            
+
             try:
                 await context.add_cookies(pw_cookies)
             except Exception as e:
@@ -287,25 +350,22 @@ class ExpertBridge:
 
             page = await context.new_page()
             try:
-                # Переходим в сам чат, где лежит этот файл
                 chat_url = f"https://alice.yandex.ru/chat/{dialog_id}" if dialog_id else "https://alice.yandex.ru/chat/"
                 await page.goto(chat_url, wait_until="domcontentloaded")
-                
+
                 file_guid = url.split("FileGuid=")[1].split("&")[0]
                 link_selector = f'a[href*="{file_guid}"]'
-                
-                # Ждём появления ссылки в DOM
+
                 await page.wait_for_selector(link_selector, timeout=15000)
-                
-                # Кликаем и ловим скачивание
+
                 async with page.expect_download(timeout=15000) as download_info:
                     await page.click(link_selector)
-                
+
                 download = await download_info.value
                 suggested_name = filename or download.suggested_filename
                 safe_name = re.sub(r'[^\w.\-]', '_', suggested_name)
                 final_path = os.path.join(self.download_dir, safe_name)
-                
+
                 await download.save_as(final_path)
                 logger.info(f"✅ Скачано через браузер (UI-клик): {final_path}")
                 return final_path
@@ -317,7 +377,7 @@ class ExpertBridge:
 
     async def _download(self, url: str, filename: Optional[str], dialog_id: Optional[str] = None) -> Optional[str]:
         is_gproxy = "rpc.alice.yandex.ru/gproxy" in url
-        
+
         if is_gproxy:
             headers = self.manager.creds.build_rpc_headers()
             request_url: Any = url
@@ -344,7 +404,7 @@ class ExpertBridge:
                         if is_gproxy:
                             return await self._download_via_browser(url, filename, dialog_id)
                         return None
-                    
+
                     data = await resp.read()
                     ct = resp.headers.get("Content-Type", "")
                     cd = resp.headers.get("Content-Disposition", "")
@@ -402,7 +462,6 @@ class ExpertBridge:
             url = src.get("FullUrl", "")
             title = src.get("DocumentTitle") or ""
             add(url, title)
-
             pv = src.get("preview_url") or (src.get("InputFileItemInfo") or {}).get("FileIcon")
             if pv and "s3-private" in pv:
                 add(pv, title or "preview")
@@ -420,9 +479,12 @@ class ExpertBridge:
 
     # ---------- execute ----------
 
-    async def _execute(self, name: str, args: Dict) -> str:
+    async def _execute(self, name: str, args: Dict, dialog_id: Optional[str] = None) -> str:
         if not name:
             return "[ошибка]: пустое имя инструмента"
+
+        if dialog_id:
+            self._download_context["dialog_id"] = dialog_id
 
         if name == "write_file" and isinstance(args, dict) and args.get("_expect_content_from_text"):
             return ('[нужно содержимое]: используй JSON-формат — '
@@ -450,7 +512,11 @@ class ExpertBridge:
         if dialog_id in self._contract_established:
             return dialog_id, None, []
 
+        self._download_context["dialog_id"] = dialog_id or None
         contract = self._build_contract()
+
+        await asyncio.sleep(1.5)
+
         ack_text: Optional[str] = None
 
         async for turn in self.manager.send_message(
@@ -458,6 +524,7 @@ class ExpertBridge:
         ):
             if turn.dialog_id:
                 dialog_id = turn.dialog_id
+                self._download_context["dialog_id"] = dialog_id
             if turn.text and turn.is_finished:
                 ack_text = turn.text
 
@@ -474,6 +541,7 @@ class ExpertBridge:
             ):
                 if turn.dialog_id:
                     dialog_id = turn.dialog_id
+                    self._download_context["dialog_id"] = dialog_id
                 if turn.text and turn.is_finished:
                     ack_text = turn.text
 
@@ -487,6 +555,7 @@ class ExpertBridge:
         dialog_id: Optional[str] = None,
     ) -> AsyncGenerator[AliceTurnResponse, None]:
         final_dialog_id = dialog_id or ""
+        self._download_context["dialog_id"] = final_dialog_id or None
 
         ack_results: List[str] = []
 
@@ -499,6 +568,7 @@ class ExpertBridge:
             )
 
             final_dialog_id, ack, ack_calls = await self._establish_contract(final_dialog_id)
+            self._download_context["dialog_id"] = final_dialog_id or None
 
             if ack:
                 if ack_calls:
@@ -513,7 +583,7 @@ class ExpertBridge:
                             ],
                             is_finished=False,
                         )
-                        result = await self._execute(name, args)
+                        result = await self._execute(name, args, dialog_id=final_dialog_id)
                         preview = result if len(result) <= 800 else result[:800] + f"… ({len(result)} B)"
                         yield AliceTurnResponse(
                             dialog_id=final_dialog_id,
@@ -549,11 +619,26 @@ class ExpertBridge:
             )
 
             final_turn: Optional[AliceTurnResponse] = None
+            prev_thinking_count = 0
+
             async for turn in self.manager.send_message(
                 text=current, agent_id=self.agent_id, dialog_id=final_dialog_id,
             ):
                 if turn.dialog_id:
                     final_dialog_id = turn.dialog_id
+                    self._download_context["dialog_id"] = final_dialog_id or None
+
+                # STREAM: каждая новая порция thinking_steps сразу в CLI.
+                if len(turn.thinking_steps) > prev_thinking_count:
+                    new_steps = turn.thinking_steps[prev_thinking_count:]
+                    prev_thinking_count = len(turn.thinking_steps)
+                    yield AliceTurnResponse(
+                        dialog_id=final_dialog_id,
+                        request_id=f"exp_think_{iteration}_{prev_thinking_count}",
+                        thinking_steps=new_steps,
+                        is_finished=False,
+                    )
+
                 final_turn = turn
 
             if not final_turn:
@@ -568,20 +653,18 @@ class ExpertBridge:
                 return
 
             raw_text = final_turn.text or ""
-            calls = self._parse_calls(raw_text)
+            label, calls = self._extract_label_and_calls(raw_text)
 
             if calls:
-                intermediate_files = self._extract_files(final_turn, raw_text)
-                if intermediate_files:
-                    for f in intermediate_files:
-                        logger.info(f"[intermediate file] {f['url'][:140]}")
+                for f in self._extract_files(final_turn, raw_text):
+                    logger.info(f"[intermediate file] {f['url'][:140]}")
 
             if not calls:
                 yield AliceTurnResponse(
                     dialog_id=final_turn.dialog_id,
                     request_id=final_turn.request_id,
                     thinking_logs=list(final_turn.thinking_logs),
-                    thinking_steps=list(final_turn.thinking_steps),
+                    thinking_steps=[],  # уже стримились выше
                     text=raw_text,
                     widgets=list(final_turn.widgets),
                     suggestions=list(final_turn.suggestions),
@@ -590,27 +673,44 @@ class ExpertBridge:
                     error=None,
                 )
 
-                if self.auto_download:
-                    files = self._extract_files(final_turn, raw_text)
-                    if files:
-                        dl_logs = []
-                        for f in files:
-                            local = await self._download(f["url"], f["title"], dialog_id=final_dialog_id)
-                            if local:
-                                dl_logs.append(f"📥 {f['title']} → {local}")
-                            else:
-                                dl_logs.append(f"⚠ {f['title']} — не скачалось")
-                        if dl_logs:
-                            yield AliceTurnResponse(
-                                dialog_id=final_dialog_id,
-                                request_id=f"exp_dl_{iteration}",
-                                thinking_logs=dl_logs,
-                                is_finished=False,
-                            )
+                files = self._extract_files(final_turn, raw_text)
+                if files and self.auto_download:
+                    dl_logs = []
+                    for f in files:
+                        local = await self._download(f["url"], f["title"], dialog_id=final_dialog_id)
+                        if local:
+                            dl_logs.append(f"📥 {f['title']} → {local}")
+                        else:
+                            dl_logs.append(f"⚠ {f['title']} — не скачалось")
+                    if dl_logs:
+                        yield AliceTurnResponse(
+                            dialog_id=final_dialog_id,
+                            request_id=f"exp_dl_{iteration}",
+                            thinking_logs=dl_logs,
+                            is_finished=False,
+                        )
+                elif files:
+                    yield AliceTurnResponse(
+                        dialog_id=final_dialog_id,
+                        request_id=f"exp_files_hint_{iteration}",
+                        thinking_logs=[
+                            f"📎 В ответе {len(files)} ссылок на файлы. "
+                            f"Авто-скачивание выключено. Скажи «скачай» — "
+                            f"Expert вызовет download_attachment явно."
+                        ],
+                        is_finished=False,
+                    )
                 return
 
-            results_for_expert: List[str] = []
+            if label:
+                yield AliceTurnResponse(
+                    dialog_id=final_dialog_id,
+                    request_id=f"exp_label_{iteration}",
+                    thinking_logs=[f"▸ {label}"],
+                    is_finished=False,
+                )
 
+            results_for_expert: List[str] = []
             for call in calls:
                 name = call["tool"]
                 args = call["args"]
@@ -622,7 +722,7 @@ class ExpertBridge:
                     is_finished=False,
                 )
 
-                result = await self._execute(name, args)
+                result = await self._execute(name, args, dialog_id=final_dialog_id)
 
                 preview = result if len(result) <= 800 else result[:800] + f"… ({len(result)} B)"
                 yield AliceTurnResponse(
@@ -636,8 +736,8 @@ class ExpertBridge:
 
             current = (
                 "\n\n".join(results_for_expert)
-                + "\n\nЕсли нужен следующий инструмент — снова JSON. "
-                  "Если готов финальный ответ — просто ответь текстом."
+                + "\n\nЕсли нужен следующий инструмент — сначала строка-описание, "
+                  "потом JSON. Если готов финальный ответ — обычный текст."
             )
 
         yield AliceTurnResponse(

@@ -519,3 +519,69 @@ async def load_tools_from_config_async(config_path: str) -> LocalToolRegistry:
             logger.warning(f"MCP '{name}' не запустился: {e}")
 
     return reg
+
+class DownloadAttachmentTool(LocalTool):
+    """
+    Скачать файл, созданный агентом в чате (xlsx, pdf, png, ...),
+    на диск пользователя. В отличие от blind-scan — только по явному
+    вызову агента: {"tool": "download_attachment", "args": {...}}.
+
+    Регистрируется ExpertBridge с downloader'ом, привязанным к _download()
+    (уже умеет RPC-headers + Playwright fallback для gproxy).
+    """
+    name = "download_attachment"
+    description = (
+        "Скачать файл, созданный агентом в чате, на диск пользователя. "
+        "Передай file_guid (uuid из ссылки get_source_file) или полный url. "
+        "Файл сохранится в ~/Downloads (или download_dir ExpertBridge). "
+        "После вызова вернётся путь и размер — можешь сказать пользователю, что файл сохранён."
+    )
+    arg_schema = {
+        "type": "object",
+        "properties": {
+            "file_guid": {
+                "type": "string",
+                "description": "uuid из https://rpc.alice.yandex.ru/gproxy/get_source_file?FileGuid=<uuid>",
+            },
+            "url": {
+                "type": "string",
+                "description": "Полный URL файла (альтернатива file_guid)",
+            },
+            "filename": {
+                "type": "string",
+                "description": "Имя файла на диске (опционально; иначе из Content-Disposition)",
+            },
+        },
+    }
+
+    def __init__(self, downloader):
+        """
+        downloader: async callable(url: str, filename: Optional[str]) -> Optional[str]
+        Возвращает путь к сохранённому файлу или None при ошибке.
+        """
+        self._downloader = downloader
+
+    async def execute(self, args):
+        file_guid = (args.get("file_guid") or "").strip()
+        url = (args.get("url") or "").strip()
+        filename = args.get("filename")
+
+        if file_guid:
+            url = f"https://rpc.alice.yandex.ru/gproxy/get_source_file?FileGuid={file_guid}"
+        if not url:
+            return ToolResult(False, "", "Нужен file_guid или url")
+
+        try:
+            path = await self._downloader(url, filename)
+        except Exception as e:
+            return ToolResult(False, "", f"download error: {e}")
+
+        if not path:
+            return ToolResult(False, "", "Не удалось скачать (HTTP + Playwright оба вернули None)")
+
+        size = 0
+        try:
+            size = os.path.getsize(path)
+        except Exception:
+            pass
+        return ToolResult(True, f"Сохранено: {path} ({size} байт)")

@@ -2,6 +2,12 @@
 """
 Alice Tools CLI. Tools + Meeseeks + Expert.
 Expert идёт через ExpertBridge (chat-based tool_call), Pro/Base — через LocalToolBridge.
+
+Изменения:
+  - auto_download=False (blind-scan выключен, только download_attachment).
+  - _render_thinking_logs: поддержка ▸ (label перед tool-call).
+  - _execute_turn_expert / _execute_turn_bridge: рендер thinking_steps и
+    thinking_logs сразу по мере прихода, не копим до финала.
 """
 
 import argparse
@@ -55,7 +61,7 @@ class AliceToolsSession(AliceCliSession):
                 tools=tools,
                 agent_id="expert",
                 download_dir="~/Downloads",
-                auto_download=True,
+                auto_download=False,          # ← было True; blind-scan выключен
                 max_iterations=8,
                 approve_callback=(None if yolo else self._approve_tool),
                 show_thinking=show_thinking,
@@ -150,7 +156,9 @@ class AliceToolsSession(AliceCliSession):
 
     def _render_thinking_logs(self, logs: List[str]):
         for log in logs:
-            if log.startswith("🔧"):
+            if log.startswith("▸"):
+                print(f"{ACCENT_CYAN}{log}{RESET}")
+            elif log.startswith("🔧"):
                 print(f"{ACCENT_YELLOW}{log}{RESET}")
             elif log.startswith("→"):
                 head, _, tail = log.partition("\n")
@@ -198,15 +206,20 @@ class AliceToolsSession(AliceCliSession):
                 if turn.error:
                     print(f"\n\033[31m[Ошибка]: {turn.error}{RESET}\n")
                     return
-                if turn.thinking_logs and not turn.text:
+
+                # thinking_steps — сразу, по мере стриминга с сервера
+                if self.show_thinking and turn.thinking_steps:
+                    self._render_thinking(turn.thinking_steps)
+
+                # thinking_logs — сразу (label / tool / result)
+                if turn.thinking_logs:
                     self._render_thinking_logs(turn.thinking_logs)
-                    continue
+
                 if turn.text:
                     print(turn.text, end="", flush=True)
+
                 if turn.is_finished:
                     print()
-                    if self.show_thinking and turn.thinking_steps:
-                        self._render_thinking(turn.thinking_steps)
                     if turn.sources:
                         self._render_sources(turn.sources)
         except (asyncio.CancelledError, KeyboardInterrupt):
@@ -227,15 +240,18 @@ class AliceToolsSession(AliceCliSession):
                 if turn.error:
                     print(f"\n\033[31m[Ошибка]: {turn.error}{RESET}\n")
                     return
-                if turn.thinking_logs and not turn.text:
+
+                if self.show_thinking and turn.thinking_steps:
+                    self._render_thinking(turn.thinking_steps)
+
+                if turn.thinking_logs:
                     self._render_thinking_logs(turn.thinking_logs)
-                    continue
+
                 if turn.text:
                     print(turn.text, end="", flush=True)
+
                 if turn.is_finished:
                     print()
-                    if self.show_thinking and turn.thinking_steps:
-                        self._render_thinking(turn.thinking_steps)
                     if turn.sources:
                         self._render_sources(turn.sources)
                     if turn.widgets:
@@ -489,7 +505,6 @@ async def async_main():
                         help="Отключить инструменты")
     parser.add_argument("--no-meeseeks", action="store_true",
                         help="Отключить мисиксы")
-    # NEW: продолжить существующий диалог (ID с сайта — /chat/<uuid>)
     parser.add_argument("--dialog-id", default=None,
                         help="Продолжить существующий диалог (ID с сайта)")
     args = parser.parse_args()
