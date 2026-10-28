@@ -777,8 +777,12 @@ async def async_main():
     if not ok:
         print(f"\033[31m[Healthcheck]: {msg}{RESET}")
         sys.exit(1)
-    auth_str = f"OAuth ({creds.token[:10]}...)" if creds.auth_type == "token" \
-        else f"Cookies ({len(creds.cookie_dict)})"
+    if creds.auth_type == "token":
+        auth_str = "OAuth"
+    elif creds.auth_type == "cookies":
+        auth_str = f"Cookies ({len(creds.cookie_dict)})"
+    else:
+        auth_str = "OAuth + cookies"
     print(f"{ACCENT_GREEN}✓{RESET} {msg} | {BOLD}{auth_str}{RESET}")
 
     manager = AliceAgentManager(creds, verbose=args.verbose, show_thinking=args.thinking)

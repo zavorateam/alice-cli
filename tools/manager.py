@@ -17,7 +17,9 @@ import json
 import logging
 import sys
 import uuid as _uuid
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Tuple
+
+import aiohttp
 
 from agents import (
     AliceAgent, AliceTurnResponse, SuggestionAction, AgentWidget,
@@ -27,7 +29,7 @@ from agents.expert import ExpertAgent
 from alice_auth import (
     AliceCredentials, resolve_auth_source, verify_credentials,
 )
-from tools.constants import uuid7
+from tools.constants import uuid7, RPC_BASE_URL
 from tools.transport import AliceWsEngine, AliceRpcClient
 
 logger = logging.getLogger("alice_manager")
@@ -195,6 +197,8 @@ class ChatSession:
         self.manager = manager
         self.dialog_id: Optional[str] = None
         self._lock = asyncio.Lock()
+        # req_id текущего запроса — чтобы cancel_current() мог разбудить генератор
+        self._current_req_id: Optional[str] = None
 
     async def ensure_dialog(self, agent_id: str = "pro") -> str:
         async with self._lock:
@@ -206,17 +210,50 @@ class ChatSession:
 
     async def send_message(self, text: str, agent_id: str = "pro", is_suggest: bool = False):
         did = await self.ensure_dialog(agent_id)
-        async for turn in self.manager.send_message(
-            text=text, agent_id=agent_id, dialog_id=did, is_suggest=is_suggest,
-        ):
-            yield turn
+        try:
+            async for turn in self.manager.send_message(
+                text=text, agent_id=agent_id, dialog_id=did, is_suggest=is_suggest,
+            ):
+                if not self._current_req_id and turn.request_id:
+                    self._current_req_id = turn.request_id
+                yield turn
+        finally:
+            self._current_req_id = None
 
-    async def cancel_current(self):
-        # manager.send_message не держит отдельного task — отмена через HTTP-клиент
-        # останавливает async-generator, ws.send_text_input сам снимает очередь.
-        return None
+    async def cancel_current(self) -> None:
+        """Разбудить текущий `send_text_input`, чтобы он вышел и очистил state.
+
+        Кладём в `queue` ошибку-cancellation, чтобы `while queue.get()` в
+        `ws.send_text_input` не висел до `agent.timeout`. После пробуждения
+        `send_text_input` попадёт в finally, удалит `_pending_responses[req_id]`,
+        `_active_agents_by_req[req_id]`, `requested_mode_by_req[req_id]`,
+        `effective_by_req[req_id]`.
+
+        Если запроса нет — no-op (нечего отменять).
+        """
+        req_id = self._current_req_id
+        if not req_id:
+            return
+        ws = getattr(self.manager, "ws", None)
+        if ws is None:
+            return
+        queue = ws._pending_responses.get(req_id)
+        if queue is None:
+            return
+        try:
+            queue.put_nowait(AliceTurnResponse(
+                dialog_id=self.dialog_id or "",
+                request_id=req_id,
+                text="",
+                is_finished=True,
+                error="cancelled by client",
+            ))
+        except Exception:
+            pass
 
     async def close(self, delete_dialog: bool = True):
+        # Если есть незавершённый запрос — разбудить его, чтобы не висел
+        await self.cancel_current()
         if delete_dialog and self.dialog_id:
             try:
                 await self.manager.rpc.delete_dialog(self.dialog_id)
@@ -225,26 +262,78 @@ class ChatSession:
         self.dialog_id = None
 
 
+
 class SessionRegistry:
     """Реестр ChatSession по X-Alice-Session-ID.
 
+    - TTL: сессия удаляется после `_ttl_seconds` простоя (по умолчанию 1 час).
+    - MAX_SESSIONS: до добавления нового sid освобождаем место так, чтобы
+      после добавления `len <= max`. Удаляются самые старые по `last_used_at`.
+    - Очистка lazy, при `acquire()` — без фонового таймера.
+
     Factory возвращает готовый (уже инициализированный) AliceAgentManager.
-    Для shared-manager сценария factory = lambda: manager — тогда shutdown()
+    Для shared-manager сценария factory = lambda: manager — shutdown()
     менеджера НЕ вызывается из ChatSession.close() (владелец — сервер).
     """
 
-    def __init__(self, manager_factory):
+    DEFAULT_TTL = 3600.0
+    DEFAULT_MAX_SESSIONS = 128
+
+    def __init__(self, manager_factory, ttl_seconds: Optional[float] = None,
+                 max_sessions: int = DEFAULT_MAX_SESSIONS):
         self._factory = manager_factory
         self._sessions: Dict[str, ChatSession] = {}
+        self._last_used: Dict[str, float] = {}
         self._owns_managers = False
         self._lock = asyncio.Lock()
+        self._ttl = self.DEFAULT_TTL if ttl_seconds is None else ttl_seconds
+        self._max = max_sessions
+
+    async def _close_one_locked(self, sid: str):
+        """Удалить одну сессию (под self._lock)."""
+        chat = self._sessions.pop(sid, None)
+        self._last_used.pop(sid, None)
+        if chat is not None:
+            try:
+                await chat.close(delete_dialog=True)
+            except Exception:
+                pass
+
+    async def _evict_ttl_locked(self):
+        """Удалить все сессии, не использованные дольше TTL."""
+        import time as _time
+        if self._ttl <= 0:
+            return
+        now = _time.time()
+        expired = [sid for sid, ts in self._last_used.items()
+                   if now - ts > self._ttl]
+        for sid in expired:
+            await self._close_one_locked(sid)
+
+    async def _make_room_locked(self, incoming: int = 1):
+        """Удалить старейшие, чтобы после добавления `incoming` новых sid
+        выполнялось `len(self._sessions) + incoming <= self._max`."""
+        if self._max <= 0:
+            return
+        overflow = len(self._sessions) + incoming - self._max
+        if overflow <= 0:
+            return
+        ordered = sorted(self._last_used.items(), key=lambda kv: kv[1])
+        for sid, _ts in ordered[:overflow]:
+            await self._close_one_locked(sid)
 
     async def acquire(self, session_id: Optional[str]) -> ChatSession:
+        import time as _time
         sid = session_id or _uuid.uuid4().hex
         async with self._lock:
-            if sid not in self._sessions:
-                mgr = await self._factory()
-                self._sessions[sid] = ChatSession(sid, mgr)
+            await self._evict_ttl_locked()
+            if sid in self._sessions:
+                self._last_used[sid] = _time.time()
+                return self._sessions[sid]
+            await self._make_room_locked(incoming=1)
+            mgr = await self._factory()
+            self._sessions[sid] = ChatSession(sid, mgr)
+            self._last_used[sid] = _time.time()
             return self._sessions[sid]
 
     async def close(self):
@@ -252,16 +341,70 @@ class SessionRegistry:
             for s in self._sessions.values():
                 await s.close(delete_dialog=False)
             self._sessions.clear()
+            self._last_used.clear()
 
     def __len__(self) -> int:
         return len(self._sessions)
 
 
+
+
 class AliceMcpServer:
-    def __init__(self, manager: Optional[AliceAgentManager] = None):
+    """MCP stdio JSON-RPC сервер + кэш per-auth AliceAgentManager.
+
+    `_managers_cache` ограничен: TTL + MAX_MANAGERS. Eviction выполняется
+    при `_get_manager_for_call()` (lazy). Вытесненный менеджер закрывается
+    через `shutdown()` — освобождаются WS-соединение и ephemeral-диалоги.
+
+    TTL по умолчанию 2 часа, лимит 32 менеджера.
+    """
+
+    DEFAULT_TTL = 7200.0
+    DEFAULT_MAX_MANAGERS = 32
+
+    def __init__(self, manager: Optional[AliceAgentManager] = None,
+                 ttl_seconds: Optional[float] = None,
+                 max_managers: int = DEFAULT_MAX_MANAGERS):
         ensure_agents_registered()
         self.manager = manager
         self._managers_cache: Dict[str, AliceAgentManager] = {}
+        self._last_used: Dict[str, float] = {}
+        self._lock = asyncio.Lock()
+        self._ttl = self.DEFAULT_TTL if ttl_seconds is None else ttl_seconds
+        self._max = max_managers
+
+    async def _close_one_locked(self, auth: str):
+        mgr = self._managers_cache.pop(auth, None)
+        self._last_used.pop(auth, None)
+        if mgr is not None:
+            try:
+                await mgr.shutdown()
+            except Exception:
+                pass
+
+    async def _evict_ttl_locked(self):
+        import time as _time
+        if self._ttl <= 0:
+            return
+        now = _time.time()
+        expired = [a for a, ts in self._last_used.items() if now - ts > self._ttl]
+        for a in expired:
+            await self._close_one_locked(a)
+
+    async def _make_room_locked(self, incoming: int = 1):
+        if self._max <= 0:
+            return
+        overflow = len(self._managers_cache) + incoming - self._max
+        if overflow <= 0:
+            return
+        ordered = sorted(self._last_used.items(), key=lambda kv: kv[1])
+        for a, _ts in ordered[:overflow]:
+            await self._close_one_locked(a)
+
+    async def _shutdown_all(self):
+        async with self._lock:
+            for a in list(self._managers_cache.keys()):
+                await self._close_one_locked(a)
 
     def _get_tools_definition(self) -> List[Dict[str, Any]]:
         tools = []
@@ -294,20 +437,39 @@ class AliceMcpServer:
         })
         return tools
 
+
     async def _get_manager_for_call(self, auth_param: Optional[str]) -> Tuple[Optional[AliceAgentManager], Optional[str]]:
+        import time as _time
         if auth_param:
-            if auth_param in self._managers_cache:
-                return self._managers_cache[auth_param], None
+            async with self._lock:
+                await self._evict_ttl_locked()
+                cached = self._managers_cache.get(auth_param)
+                if cached is not None:
+                    self._last_used[auth_param] = _time.time()
+                    return cached, None
+            # Валидация и создание — вне lock (initialize делает сетевой I/O)
             creds = resolve_auth_source(auth_param)
             if not creds:
-                return None, f"Не удалось распарсить токен: {auth_param[:20]}..."
+                return None, "Не удалось распарсить переданный auth-параметр"
             ok, msg = await verify_credentials(creds)
             if not ok:
                 return None, f"Ошибка авторизации: {msg}"
             mgr = AliceAgentManager(creds, verbose=False)
             await mgr.initialize()
-            self._managers_cache[auth_param] = mgr
-            return mgr, None
+            async with self._lock:
+                # Повторная проверка: пока initialize шёл, могли положить тот же auth
+                existing = self._managers_cache.get(auth_param)
+                if existing is not None:
+                    try:
+                        await mgr.shutdown()
+                    except Exception:
+                        pass
+                    self._last_used[auth_param] = _time.time()
+                    return existing, None
+                await self._make_room_locked(incoming=1)
+                self._managers_cache[auth_param] = mgr
+                self._last_used[auth_param] = _time.time()
+                return mgr, None
         if self.manager:
             return self.manager, None
         return None, "Авторизация не настроена."
@@ -355,6 +517,7 @@ class AliceMcpServer:
             return {"content": [{"type": "text", "text": json.dumps(result_obj, ensure_ascii=False, indent=2)}]}
 
         return {"isError": True, "content": [{"type": "text", "text": f"Неизвестный инструмент: {tool_name}"}]}
+
 
     async def run_stdio(self):
         reader = asyncio.StreamReader()

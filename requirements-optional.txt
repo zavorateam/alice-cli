@@ -1,0 +1,3 @@
+# Optional: Playwright fallback для скачивания файлов Expert
+playwright>=1.40
+# после установки: playwright install chromium

@@ -431,9 +431,13 @@ def load_credentials_with_cookies(
         if cookies_creds.device_uuid:
             token_creds.device_uuid = cookies_creds.device_uuid
         token_creds.auth_type = "both"
+        import hashlib
+        fp = hashlib.sha256(
+            (token_creds.device_uuid or "").encode("utf-8")
+        ).hexdigest()[:10]
         logger.info(
             f"Auth: OAuth + cookies "
-            f"(device_uuid={token_creds.device_uuid}, "
+            f"(device_fp={fp}, "
             f"cookies {len(token_creds.cookie_header.split(';')) if token_creds.cookie_header else 0}"
             f"/{len(cookies_creds.cookie_dict)})"
         )

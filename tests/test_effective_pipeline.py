@@ -13,10 +13,14 @@ def _engine():
 
 
 def test_handle_vins_response_nested_only():
+    import asyncio
     eng = _engine()
     raw = json.loads((FIX / "vins_real_nested_only.json").read_text())
     header = raw["header"]
     payload = raw["payload"]
+    # Регистрируем запрос как активный: иначе _handle_vins_response
+    # пропустит late-кадр (см. tests/test_late_vins_response.py).
+    eng._pending_responses[header["refMessageId"]] = asyncio.Queue()
     eng.requested_mode_by_req[header["refMessageId"]] = "Pro"
     eng._handle_vins_response(header, payload)
     eff = eng.effective_by_req[header["refMessageId"]]
@@ -26,9 +30,11 @@ def test_handle_vins_response_nested_only():
 
 
 def test_handle_vins_response_top_and_nested():
+    import asyncio
     eng = _engine()
     raw = json.loads((FIX / "vins_real_both_forms.json").read_text())
     header = raw["header"]
+    eng._pending_responses[header["refMessageId"]] = asyncio.Queue()
     eng.requested_mode_by_req[header["refMessageId"]] = "Pro"
     eng._handle_vins_response(header, raw["payload"])
     eff = eng.effective_by_req[header["refMessageId"]]
@@ -37,9 +43,11 @@ def test_handle_vins_response_top_and_nested():
 
 
 def test_handle_vins_response_trial_state():
+    import asyncio
     eng = _engine()
     raw = json.loads((FIX / "vins_legacy_effective.json").read_text())
     header = raw["header"]
+    eng._pending_responses[header["refMessageId"]] = asyncio.Queue()
     eng.requested_mode_by_req[header["refMessageId"]] = "External"
     eng._handle_vins_response(header, raw["payload"])
     assert eng.expert_trial_left == 3
@@ -54,9 +62,11 @@ def test_handle_vins_response_missing_ref_does_nothing():
 
 
 def test_handle_vins_response_no_effective_field():
+    import asyncio
     eng = _engine()
     raw = json.loads((FIX / "vins_no_effective.json").read_text())
     header = raw["header"]
+    eng._pending_responses[header["refMessageId"]] = asyncio.Queue()
     eng.requested_mode_by_req[header["refMessageId"]] = "Pro"
     eng._handle_vins_response(header, raw["payload"])
     eff = eng.effective_by_req[header["refMessageId"]]

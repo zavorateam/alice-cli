@@ -195,10 +195,15 @@ class ModelCatalog:
         s.last_checked = time.time()
 
     def warm_up(self) -> "asyncio.Task":
-        """Одноразовый healthcheck на базовые модели (не Expert/Apps)."""
+        """Фоновый healthcheck базовых моделей.
+
+        Pro проверяем тоже: без него /v1/models/diagnostics никогда не покажет
+        деградацию Pro → Base, а /v1/chat/completions отклонит Pro как implemented.
+        Expert не трогаем — у него квота ~5/24ч, healthcheck только по явному запросу
+        (TTL 6ч + 1/сутки, см. _should_recheck).
+        """
         async def _run():
-            # Только Base — дешёвая и без квоты. Pro/Expert — на явный запрос.
-            for mid in ("alice-base",):
+            for mid in ("alice-base", "alice-pro"):
                 try:
                     await self.healthcheck(mid)
                 except Exception:
@@ -280,6 +285,38 @@ def _flatten_messages(messages: List[dict]) -> str:
     return "\n\n".join(parts).strip()
 
 
+def _inject_tool_instructions(prompt: str, tools: List[dict], tool_choice: str) -> str:
+    """Добавляет к prompt явные определения инструментов и контракт вызова.
+
+    Без этого Алиса не знает, какие функции ей доступны — клиент передал tools,
+    а до модели они не доходят. Формат — как в tool_bridge.py (JSON-маркер),
+    но с явным списком имён и схем из запроса.
+    """
+    lines = ["[SYSTEM — доступные инструменты]"]
+    for t in tools:
+        fn = t.get("function") or {}
+        name = fn.get("name", "")
+        if not name:
+            continue
+        desc = (fn.get("description") or "").strip().replace("\n", " ")
+        params = fn.get("parameters") or {"type": "object", "properties": {}}
+        lines.append(f"- {name}: {desc}")
+        try:
+            lines.append("  schema: " + json.dumps(params, ensure_ascii=False))
+        except Exception:
+            lines.append("  schema: <unserializable>")
+    lines.append("")
+    if tool_choice == "required":
+        lines.append("ПРАВИЛО: вызови ровно один инструмент из списка выше.")
+    else:
+        lines.append("ПРАВИЛО: если нужен инструмент — верни ТОЛЬКО маркер ниже.")
+    lines.append('Формат вызова: <tool_call>{"tool": "<имя>", "args": {...}}</tool_call>')
+    lines.append("Не выдумывай имена вне списка. Не пиши текст вокруг маркера.")
+    lines.append("[КОНЕЦ SYSTEM]")
+    lines.append("")
+    return "\n".join(lines) + prompt
+
+
 def _extract_tool_calls(text: str, tools: List[dict]) -> List[dict]:
     import re
     allowed = {(t.get("function") or {}).get("name") for t in tools}
@@ -346,16 +383,36 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
                 {"error": {"message": f"model {model!r} not found", "type": "invalid_request_error"}},
                 status_code=404,
             )
+        # Контракт: implemented/unknown ещё не подтверждены и не публикуются
+        # в /v1/models — значит, и в chat их использовать нельзя.
+        # available и degraded (Pro→Base) разрешены; degraded явно, но не притворяемся Pro.
+        if state.status in ("implemented", "unknown"):
+            return JSONResponse(
+                {"error": {"message": f"model {model!r} has not been verified yet; "
+                                       f"call /v1/models/diagnostics or wait for warm_up",
+                           "type": "model_not_verified"}},
+                status_code=503,
+            )
         if state.status == "unavailable":
             return JSONResponse(
                 {"error": {"message": f"model {model!r} is currently unavailable: {state.reason}",
                            "type": "model_unavailable"}},
                 status_code=503,
             )
+        _VALID_TOOL_CHOICES = {"auto", "none", "required"}
+        if isinstance(tool_choice, str) and tool_choice not in _VALID_TOOL_CHOICES:
+            return JSONResponse(
+                {"error": {"message": f"tool_choice={tool_choice!r} is not supported; "
+                                       f"use auto, none or required",
+                           "type": "invalid_request_error"}},
+                status_code=400,
+            )
         if tool_choice == "none":
             tools = []
 
         prompt = _flatten_messages(messages)
+        if tools:
+            prompt = _inject_tool_instructions(prompt, tools, tool_choice)
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
         agent_id = state.agent_id

@@ -559,11 +559,10 @@ class AliceWsEngine:
         if attachments:
             payload["event"]["payload"]["request"]["attachments"] = attachments
 
-        self.requested_mode_by_req[req_id] = mode
-
         queue: asyncio.Queue = asyncio.Queue()
         self._pending_responses[req_id] = queue
         self._active_agents_by_req[req_id] = agent
+        self.requested_mode_by_req[req_id] = mode
 
         logger.info(
             f"TEXTINPUT preset={preset!r} mode={mode!r} "
@@ -571,9 +570,8 @@ class AliceWsEngine:
             f"caps={len(capabilities)} exp={len(experiments)} feat={len(supported_features)}"
         )
 
-        await self._send_json(payload)
-
         try:
+            await self._send_json(payload)
             while True:
                 resp = await asyncio.wait_for(queue.get(), timeout=agent.timeout)
                 if resp.is_finished:
@@ -589,11 +587,20 @@ class AliceWsEngine:
         finally:
             self._pending_responses.pop(req_id, None)
             self._active_agents_by_req.pop(req_id, None)
+            self.requested_mode_by_req.pop(req_id, None)
+            self.effective_by_req.pop(req_id, None)
 
     def _handle_vins_response(self, header: Dict[str, Any], payload: Dict[str, Any]) -> None:
         ref_id = header.get("refMessageId") or header.get("ref_message_id")
         if not ref_id:
             logger.debug("VinsResponse без refMessageId — пропускаю")
+            return
+        # Если запрос уже завершён (finally в send_text_input уже сработал) —
+        # не создаём effective_by_req для мёртвого req_id, иначе утечка state.
+        # Live-прогон 2026-10-28 показал: VinsResponse приходит через 4 секунды
+        # после DeferredAliceResponse(is_last=true).
+        if ref_id not in self._pending_responses:
+            logger.debug("VinsResponse[ref=%s] late/unknown — skip", ref_id[-8:])
             return
         requested = self.requested_mode_by_req.get(ref_id)
         eff = normalize_effective_mode(payload, requested_mode=requested)
@@ -601,9 +608,11 @@ class AliceWsEngine:
         if eff.trial_left is not None:
             self.expert_trial_left = eff.trial_left
             self.expert_trial_limit = eff.trial_limit
+        # uuid7: старшие 32 бита = ms timestamp, за 49 дней не меняются.
+        # ref_id[:8] бесполезен для идентификации — берём последние 8 hex.
         logger.info(
-            "VinsResponse[%s] requested=%s effective=%s preset=%s src=%s degraded=%s",
-            ref_id[:8], eff.requested_mode, eff.effective_mode,
+            "VinsResponse[ref=%s] requested=%s effective=%s preset=%s src=%s degraded=%s",
+            ref_id[-8:], eff.requested_mode, eff.effective_mode,
             eff.effective_preset, eff.source_path, eff.degraded,
         )
 
