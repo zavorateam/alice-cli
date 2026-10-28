@@ -31,17 +31,26 @@ class _SlowSession:
 
 
 class _FastSession:
+    """Fake session: принимает [(text, finished), ...] или [text, ...].
+
+    Каждый tuple → один AliceTurnResponse с указанным is_finished.
+    Строка → один AliceTurnResponse с is_finished=True.
+    Тексты передаются как есть — caller сам формирует накопительные снимки
+    (как production DeferredAliceResponse) или дельты.
+    """
     def __init__(self, turns):
-        self._turns = turns
+        self._turns = list(turns)
         self.dialog_id = "d"
         self._active = 0
-
     async def send_message(self, prompt, agent_id="pro", is_suggest=False):
         from agents.base import AliceTurnResponse
-        for text, finished in self._turns:
+        for item in self._turns:
+            if isinstance(item, tuple):
+                text, finished = item
+            else:
+                text, finished = item, True
             yield AliceTurnResponse(dialog_id="d", request_id="r",
                                     text=text, is_finished=finished)
-
     async def cancel_current(self):
         return None
 
@@ -94,12 +103,14 @@ def test_responses_stream_event_order():
 # ---------- cleanup <tool_call> маркеров ----------
 
 def test_responses_stream_tool_call_cleans_markers():
-    """Если модель вернула tool_call, output_text.done должен быть без маркера."""
+    """Маркер не должен попадать в output_text.delta.
+    "".join(deltas) == output_text.done.text.
+    """
     tool_text = 'Checking weather. <tool_call>{"tool":"get_weather","args":{"city":"M"}}</tool_call>'
     session = _FastSession([(tool_text, True)])
     client = _client(session)
 
-    lines = []
+    events_data = []
     with client.stream("POST", "/v1/responses", json={
         "model": "alice-base",
         "input": "weather?",
@@ -112,23 +123,106 @@ def test_responses_stream_tool_call_cleans_markers():
         }],
     }) as resp:
         for line in resp.iter_lines():
-            if line:
-                lines.append(line)
+            if line.startswith("data: "):
+                events_data.append(json.loads(line[len("data: "):]))
 
-    joined = "\n".join(lines)
-    # function_call emitted
-    assert '"type": "function_call"' in joined
-    assert '"name": "get_weather"' in joined
-    # output_text.done — без marker
-    done_lines = [l for l in lines if "response.output_text.done" in l]
-    assert done_lines, "нет output_text.done"
-    done_data = done_lines[0]
-    assert "<tool_call>" not in done_data, (
-        f"маркер утёк в output_text.done: {done_data[:200]}"
+    # delta НЕ содержит маркера
+    deltas = []
+    for ev in events_data:
+        if ev.get("type") == "response.output_text.delta":
+            assert "<tool_call>" not in ev["delta"], \
+                f"маркер в output_text.delta: {ev['delta']!r}"
+            deltas.append(ev["delta"])
+
+    # done НЕ содержит маркера, и "".join(deltas) == done.text
+    done_events = [ev for ev in events_data if ev.get("type") == "response.output_text.done"]
+    assert done_events, "нет output_text.done"
+    done_text = done_events[0]["text"]
+    assert "<tool_call>" not in done_text
+    assert "Checking" in done_text
+    glued = "".join(deltas)
+    assert glued == done_text, (
+        f"склеенные дельты не совпадают с done: {glued!r} != {done_text!r}"
     )
 
+    # function_call emitted
+    fc_events = [ev for ev in events_data
+                 if ev.get("type") == "response.function_call_arguments.done"]
+    assert len(fc_events) == 1, (
+        f"ожидался response.function_call_arguments.done, "
+        f"got types={[ev.get('type') for ev in events_data]}"
+    )
+    assert fc_events[0]["name"] == "get_weather"
 
-# ---------- response.failed для upstream error ----------
+
+def test_responses_stream_marker_split_across_deltas():
+    """Маркер разбит на несколько дельт — фильтр склеивает состояние."""
+    # 3 turn-а с накопительными снимками (как production DeferredAliceResponse).
+    # _run_alice_stream вычисляет дельту как full[sent_len:] — работает с
+    # накопительными, не с чистыми дельтами.
+    session = _FastSession([
+        ("Hello. <tool_", False),
+        ('Hello. <tool_call>{"tool":"get_weather",', False),
+        ('Hello. <tool_call>{"tool":"get_weather","args":{}}</tool_call> Done.', True),
+    ])
+    client = _client(session)
+
+    events_data = []
+    with client.stream("POST", "/v1/responses", json={
+        "model": "alice-base",
+        "input": "weather?",
+        "stream": True,
+        "tools": [{
+            "type": "function",
+            "name": "get_weather",
+            "parameters": {"type": "object",
+                           "properties": {"city": {"type": "string"}}},
+        }],
+    }) as resp:
+        for line in resp.iter_lines():
+            if line.startswith("data: "):
+                events_data.append(json.loads(line[len("data: "):]))
+
+    deltas = [ev["delta"] for ev in events_data
+              if ev.get("type") == "response.output_text.delta"]
+    for d in deltas:
+        assert "<tool_call>" not in d
+        assert "</tool_call>" not in d
+
+    done_events = [ev for ev in events_data if ev.get("type") == "response.output_text.done"]
+    done_text = done_events[0]["text"]
+    assert "Hello." in done_text
+    assert "Done." in done_text
+    assert "<tool_call>" not in done_text
+    assert "</tool_call>" not in done_text
+    assert "".join(deltas) == done_text
+
+
+def test_responses_stream_malformed_marker_stripped():
+    """<tool_call>bad</tool_call> (без JSON) тоже убирается из delta."""
+    text = 'Pre <tool_call>broken</tool_call> Post'
+    session = _FastSession([(text, True)])
+    client = _client(session)
+
+    events_data = []
+    with client.stream("POST", "/v1/responses", json={
+        "model": "alice-base",
+        "input": "x",
+        "stream": True,
+    }) as resp:
+        for line in resp.iter_lines():
+            if line.startswith("data: "):
+                events_data.append(json.loads(line[len("data: "):]))
+
+    deltas = [ev["delta"] for ev in events_data
+              if ev.get("type") == "response.output_text.delta"]
+    done_events = [ev for ev in events_data if ev.get("type") == "response.output_text.done"]
+    done_text = done_events[0]["text"]
+    assert "Pre" in done_text
+    assert "Post" in done_text
+    assert "broken" not in done_text
+    assert "".join(deltas) == done_text
+
 
 def test_responses_stream_error_uses_failed_event():
     """При upstream error — событие response.failed, НЕ completed со status=failed."""

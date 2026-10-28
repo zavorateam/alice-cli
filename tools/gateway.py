@@ -627,13 +627,81 @@ async def _run_alice_stream(session, prompt, agent_id, tools, tool_choice,
             return
 
 
+class _ToolMarkerFilter:
+    """Stateful filter: strips <tool_call>...</tool_call> из потока.
+
+    feed(text) → безопасный к эмиту текст (может быть "").
+    flush()    → остаток на финале ("" если открытый маркер не закрыт).
+
+    Инвариант:
+        feed(t1) + feed(t2) + ... + flush() == _clean_tool_markers(t1 + t2 + ...)
+    """
+
+    TAG_OPEN = "<tool_call>"
+    TAG_CLOSE = "</tool_call>"
+
+    def __init__(self):
+        self._in_marker = False
+        self._buffer = ""
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+        self._buffer += text
+        out_parts = []
+        while self._buffer:
+            if self._in_marker:
+                idx = self._buffer.find(self.TAG_CLOSE)
+                if idx < 0:
+                    # держим tail в len(TAG_CLOSE)-1 символ — тег может быть разбит
+                    keep = len(self.TAG_CLOSE) - 1
+                    if len(self._buffer) > keep:
+                        self._buffer = self._buffer[-keep:] if keep else ""
+                    break
+                self._buffer = self._buffer[idx + len(self.TAG_CLOSE):]
+                self._in_marker = False
+                continue
+            idx = self._buffer.find(self.TAG_OPEN)
+            if idx < 0:
+                keep = 0
+                max_k = min(len(self._buffer), len(self.TAG_OPEN) - 1)
+                for k in range(max_k, 0, -1):
+                    if self._buffer.endswith(self.TAG_OPEN[:k]):
+                        keep = k
+                        break
+                if keep:
+                    emit = self._buffer[:len(self._buffer) - keep]
+                    self._buffer = self._buffer[len(self._buffer) - keep:]
+                else:
+                    emit = self._buffer
+                    self._buffer = ""
+                if emit:
+                    out_parts.append(emit)
+                break
+            emit = self._buffer[:idx]
+            if emit:
+                out_parts.append(emit)
+            self._buffer = self._buffer[idx + len(self.TAG_OPEN):]
+            self._in_marker = True
+        return "".join(out_parts)
+
+    def flush(self) -> str:
+        if self._in_marker:
+            self._buffer = ""
+            return ""
+        out = self._buffer
+        self._buffer = ""
+        return out
+
+
 def _clean_tool_markers(text: str) -> str:
-    """Убирает <tool_call>{...}</tool_call> из текста для output_text."""
-    import re as _re
-    return _re.sub(
-        r"<tool_call>\s*\{.*?\}\s*</tool_call>",
-        "", text or "", flags=_re.DOTALL,
-    ).strip()
+    """Удаляет <tool_call>...</tool_call> блоки из полного текста.
+
+    Использует тот же stateful filter, что и streaming — результаты совпадают.
+    Не .strip() — для консистентности с потоковой выдачей (deltas == done.text).
+    """
+    f = _ToolMarkerFilter()
+    return f.feed(text or "") + f.flush()
 
 
 def _parse_responses_text_format(body: dict) -> tuple:
@@ -1603,7 +1671,7 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
                 else:
                     tool_calls = valid
 
-            clean_text = _clean_tool_markers(text) if tool_calls else text
+            clean_text = _clean_tool_markers(text)
             output = _format_responses_output(clean_text, tool_calls, canonical_tools)
             if store_response:
                 try:
@@ -1631,8 +1699,9 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
             return f"event: {type_}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
         async def streamer():
-            # Реальный streaming: события эмитятся по мере прихода turn-ов.
-            # Не ждём is_finished, не собираем весь текст заранее.
+            # Real-time streaming + stateful filter.
+            # <tool_call>...</tool_call> не попадает в output_text.delta.
+            # Инвариант: "".join(deltas) == output_text.done.text.
             yield await _event("response.created", {
                 "type": "response.created",
                 "response": {
@@ -1645,16 +1714,19 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
             })
             msg_item_id = f"msg_{uuid.uuid4().hex[:20]}"
             msg_started = False
-            full_text_acc = ""
             output_items = []
+            marker_filter = _ToolMarkerFilter()
+            emitted_parts = []
+
             try:
                 async for ev in _run_alice_stream(
                     session, prompt, agent_id, canonical_tools,
                     tool_choice, catalog, model,
                 ):
                     if ev["kind"] == "text_delta":
-                        delta = ev["text"]
-                        full_text_acc += delta
+                        filtered = marker_filter.feed(ev["text"])
+                        if not filtered:
+                            continue
                         if not msg_started:
                             msg_started = True
                             yield await _event("response.output_item.added", {
@@ -1678,35 +1750,70 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
                                 "part": {"type": "output_text",
                                          "text": "", "annotations": []},
                             })
+                        emitted_parts.append(filtered)
                         yield await _event("response.output_text.delta", {
                             "type": "response.output_text.delta",
                             "response_id": response_id,
                             "item_id": msg_item_id,
                             "output_index": 0,
                             "content_index": 0,
-                            "delta": delta,
+                            "delta": filtered,
                         })
                     elif ev["kind"] == "finished":
+                        tail = marker_filter.flush()
+                        if tail:
+                            if not msg_started:
+                                msg_started = True
+                                yield await _event("response.output_item.added", {
+                                    "type": "response.output_item.added",
+                                    "response_id": response_id,
+                                    "output_index": 0,
+                                    "item": {
+                                        "type": "message",
+                                        "id": msg_item_id,
+                                        "role": "assistant",
+                                        "status": "in_progress",
+                                        "content": [],
+                                    },
+                                })
+                                yield await _event("response.content_part.added", {
+                                    "type": "response.content_part.added",
+                                    "response_id": response_id,
+                                    "item_id": msg_item_id,
+                                    "output_index": 0,
+                                    "content_index": 0,
+                                    "part": {"type": "output_text",
+                                             "text": "", "annotations": []},
+                                })
+                            emitted_parts.append(tail)
+                            yield await _event("response.output_text.delta", {
+                                "type": "response.output_text.delta",
+                                "response_id": response_id,
+                                "item_id": msg_item_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "delta": tail,
+                            })
                         tool_calls = ev["tool_calls"]
-                        full_text = ev["full_text"]
-                        # responses stream: args validation (без retry — SSE стартовал)
+
+                        # Schema validation (не потерять — было в предыдущей версии)
                         if tool_calls and canonical_tools:
                             _valid, _invalid = _validate_tool_calls_args(
                                 tool_calls, canonical_tools)
                             if _invalid:
                                 _err = "; ".join(
-                                    f"{c['function']['name']}: {e}" for c, e in _invalid)
+                                    f"{c['function']['name']}: {e}"
+                                    for c, e in _invalid)
                                 yield await _event("response.failed", {
                                     "type": "response.failed",
                                     "response_id": response_id,
-                                    "error": {
-                                        "type": "tool_arguments_invalid",
-                                        "message": _err,
-                                    },
+                                    "error": {"type": "tool_arguments_invalid",
+                                              "message": _err},
                                 })
                                 return
                             tool_calls = _valid
-                        cleaned = _clean_tool_markers(full_text) if tool_calls else full_text
+
+                        cleaned = "".join(emitted_parts)
                         if msg_started:
                             yield await _event("response.output_text.done", {
                                 "type": "response.output_text.done",
@@ -1771,7 +1878,8 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
                         if store_response:
                             try:
                                 did = getattr(session, "dialog_id", None)
-                                response_store.put(response_id, did or "", model, session_id)
+                                response_store.put(response_id, did or "",
+                                                   model, session_id)
                             except Exception:
                                 pass
                         yield await _event("response.completed", {
@@ -1791,21 +1899,14 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
                 yield await _event("response.failed", {
                     "type": "response.failed",
                     "response_id": response_id,
-                    "error": {
-                        "type": "session_conflict",
-                        "message": str(e),
-                    },
+                    "error": {"type": "session_conflict", "message": str(e)},
                 })
                 return
             except Exception as e:
-                # Правильный event для ошибки — response.failed (не completed/failed).
                 yield await _event("response.failed", {
                     "type": "response.failed",
                     "response_id": response_id,
-                    "error": {
-                        "type": "upstream_error",
-                        "message": str(e),
-                    },
+                    "error": {"type": "upstream_error", "message": str(e)},
                 })
                 return
 
