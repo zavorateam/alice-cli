@@ -363,9 +363,18 @@ def load_credentials_with_cookies(
         elif c and c.auth_type == "token" and not token_creds:
             token_creds = c
 
-    if strict_explicit and explicit_attempted and not (token_creds or cookies_creds):
-        logger.error("Явно указанные credentials не удалось разобрать; fallback отключён.")
-        return None
+    if strict_explicit:
+        # Если пользователь явно передал источник, но он не разобрался —
+        # отказ. Если ничего явно не передано — обычный fallback (env/файлы),
+        # НЕ блокируем.
+        if token_source and not token_creds:
+            logger.error("Явно заданный token не удалось разобрать; "
+                         "fallback на env/файлы отключён.")
+            return None
+        if cookies_source and not cookies_creds:
+            logger.error("Явно заданные cookies не удалось разобрать; "
+                         "fallback на env/файлы отключён.")
+            return None
 
     # 3. Env
     if token_creds is None:

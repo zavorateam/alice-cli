@@ -191,7 +191,11 @@ def test_parallel_true_allows_multiple():
 # ---------------- forced function ----------------
 
 def test_forced_function_filters_wrong_call():
-    """tool_choice задаёт get_time, модель вызвала get_weather → 0 вызовов."""
+    """tool_choice задаёт get_time, модель вызвала get_weather → 422.
+
+    Раньше возвращался finish_reason='stop' (маскировка violation под успех).
+    Контракт OpenAI: forced function должна быть вызвана именно она.
+    """
     client, _ = _client([
         '<tool_call>{"tool": "get_weather", "args": {}}</tool_call>',
     ])
@@ -201,11 +205,9 @@ def test_forced_function_filters_wrong_call():
         "tools": TOOLS,
         "tool_choice": {"type": "function", "function": {"name": "get_time"}},
     })
-    assert r.status_code == 200
+    assert r.status_code == 422, f"got {r.status_code}: {r.text[:300]}"
     body = r.json()
-    # Не tool_calls, потому что отфильтровано; контент — исходный текст
-    assert body["choices"][0]["finish_reason"] == "stop"
-    assert "tool_calls" not in body["choices"][0]["message"]
+    assert body["error"]["type"] == "tool_choice_violated"
 
 
 def test_forced_function_passes_correct_call():

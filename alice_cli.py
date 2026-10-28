@@ -778,6 +778,7 @@ async def async_main():
         token_source=args.auth or args.token,
         cookies_source=args.cookies,
         allow_interactive=True,
+        strict_explicit=True,
     )
     if not creds:
         print("\033[31m[Ошибка]: Авторизация не настроена.\033[0m")

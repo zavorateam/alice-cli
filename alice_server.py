@@ -172,6 +172,14 @@ async def main_async(args):
             sys.exit(1)
 
     if args.http:
+        _host = (args.host or "127.0.0.1").strip()
+        _loopback = {"127.0.0.1", "::1", "localhost", "ip6-localhost"}
+        if _host not in _loopback and not (os.environ.get("ALICE_API_KEY") or "").strip():
+            logger.error(
+                f"Отказ: bind на {_host!r} без ALICE_API_KEY. "
+                f"Установите ALICE_API_KEY=<секрет> или используйте --host 127.0.0.1."
+            )
+            sys.exit(2)
         import uvicorn
         from tools.gateway import ModelCatalog, attach_openai_routes
 
@@ -187,7 +195,8 @@ async def main_async(args):
             except Exception:
                 pass
             try:
-                catalog.warm_up()
+                await catalog.warm_up()
+                logger.info("catalog.warm_up: base + pro проверены")
             except Exception as e:
                 logger.warning(f"catalog.warm_up: {e!r}")
         attach_openai_routes(app, catalog, session_registry)

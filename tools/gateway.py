@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
 from tools.effective import EffectiveMode, normalize_effective_mode
+from tools.manager import SessionConflictError
 
 logger = logging.getLogger("alice_gateway")
 
@@ -252,21 +253,17 @@ class ModelCatalog:
         s.reason = reason
         s.last_checked = time.time()
 
-    def warm_up(self) -> "asyncio.Task":
-        """Фоновый healthcheck базовых моделей.
+    async def warm_up(self) -> None:
+        """Healthcheck базовых моделей (base + pro), awaited до server.serve().
 
-        Pro проверяем тоже: без него /v1/models/diagnostics никогда не покажет
-        деградацию Pro → Base, а /v1/chat/completions отклонит Pro как implemented.
-        Expert не трогаем — у него квота ~5/24ч, healthcheck только по явному запросу
-        (TTL 6ч + 1/сутки, см. _should_recheck).
+        Ошибки не валят старт — модель просто останется implemented.
+        Expert не трогаем — у него квота ~5/24ч, healthcheck только по запросу.
         """
-        async def _run():
-            for mid in ("alice-base", "alice-pro"):
-                try:
-                    await self.healthcheck(mid)
-                except Exception:
-                    pass
-        return asyncio.create_task(_run())
+        for mid in ("alice-base", "alice-pro"):
+            try:
+                await self.healthcheck(mid)
+            except Exception:
+                pass
 
     def set_status(self, model_id: str, status: str,
                    reason: Optional[str] = None,
@@ -386,6 +383,71 @@ def _forced_function_name(tool_choice) -> Optional[str]:
     return name if isinstance(name, str) and name else None
 
 
+_JSONSCHEMA_AVAILABLE = None
+
+
+def _jsonschema_available() -> bool:
+    global _JSONSCHEMA_AVAILABLE
+    if _JSONSCHEMA_AVAILABLE is None:
+        try:
+            import jsonschema  # noqa
+            _JSONSCHEMA_AVAILABLE = True
+        except ImportError:
+            _JSONSCHEMA_AVAILABLE = False
+    return _JSONSCHEMA_AVAILABLE
+
+
+def _get_tool_schema(tools: List[dict], name: str) -> Optional[dict]:
+    for t in tools:
+        fn = t.get("function") or {}
+        if fn.get("name") == name:
+            return fn.get("parameters") or {}
+    return None
+
+
+def _validate_tool_args(args_json: str, schema: dict) -> tuple:
+    """Валидирует JSON args против JSON Schema.
+
+    Возвращает (parsed_or_None, error_str_or_None).
+    Пустая schema == {} → пропускаем валидацию.
+    """
+    try:
+        parsed = json.loads(args_json)
+    except json.JSONDecodeError as e:
+        return None, f"invalid JSON: {e.msg} at pos {e.pos}"
+    if not schema or not _jsonschema_available():
+        return parsed, None
+    try:
+        import jsonschema as _js
+        _js.validate(instance=parsed, schema=schema)
+    except Exception as e:
+        # ValidationError или SchemaError
+        import jsonschema as _js
+        if isinstance(e, _js.ValidationError):
+            path = "/".join(str(p) for p in e.absolute_path) or "(root)"
+            return None, f"schema violation at {path}: {e.message}"
+        if isinstance(e, _js.SchemaError):
+            return None, f"invalid JSON Schema: {e.message}"
+        return None, f"validation error: {e}"
+    return parsed, None
+
+
+def _validate_tool_calls_args(tool_calls: List[dict],
+                              tools: List[dict]) -> tuple:
+    """Возвращает (valid_calls, [(call, error_msg), ...])."""
+    valid, invalid = [], []
+    for tc in tool_calls:
+        name = tc["function"]["name"]
+        args_json = tc["function"]["arguments"]
+        schema = _get_tool_schema(tools, name) or {}
+        _parsed, err = _validate_tool_args(args_json, schema)
+        if err is not None:
+            invalid.append((tc, err))
+        else:
+            valid.append(tc)
+    return valid, invalid
+
+
 def _validate_tool_request(tools: List[dict], tool_choice,
                             parallel_tool_calls) -> Optional[dict]:
     """Валидация tools + tool_choice. Возвращает error_dict или None."""
@@ -420,6 +482,20 @@ def _validate_tool_request(tools: List[dict], tool_choice,
             return {"error": {"message": f"duplicate function name {name!r}",
                               "type": "invalid_request_error"}}
         names.add(name)
+        # Schema well-formedness (если доступен jsonschema)
+        params = fn.get("parameters")
+        if params is not None:
+            if not isinstance(params, dict):
+                return {"error": {"message": f"tools[{i}].function.parameters must be an object",
+                                  "type": "invalid_request_error"}}
+            if _jsonschema_available():
+                try:
+                    import jsonschema as _js
+                    _js.Draft202012Validator.check_schema(params)
+                except Exception as e:
+                    return {"error": {"message": f"tools[{i}].function.parameters is not a valid "
+                                                  f"JSON Schema: {e}",
+                                      "type": "invalid_request_error"}}
     if isinstance(tool_choice, dict):
         forced = _forced_function_name(tool_choice)
         if not forced:
@@ -508,6 +584,104 @@ def _validate_response_format(rf) -> tuple:
     return "", {"error": {"message": f"response_format.type={t!r} is not supported "
                                       f"(supported: text, json_object, json_schema)",
                           "type": "invalid_request_error"}}
+
+
+async def _run_alice_stream(session, prompt, agent_id, tools, tool_choice,
+                              catalog, model):
+    """Генератор: отдаёт события по мере поступления turn-ов от Alice.
+
+    Yield-ит dict-события:
+      {"kind": "text_delta", "text": "..."}      — новый кусок текста
+      {"kind": "finished", "full_text": "...",
+       "tool_calls": [...], "last_turn": turn}   — финал (успешный)
+
+    Бросает RuntimeError при upstream error. Никакого буфера «собрать всё».
+    """
+    sent_len = 0
+    tool_calls = []
+    last = None
+    async for turn in session.send_message(prompt, agent_id=agent_id):
+        if getattr(turn, "error", None):
+            raise RuntimeError(turn.error)
+        last = turn
+        full = turn.text or ""
+        if len(full) > sent_len:
+            new_text = full[sent_len:]
+            sent_len = len(full)
+            yield {"kind": "text_delta", "text": new_text}
+        if getattr(turn, "is_finished", False):
+            full_text = turn.text or ""
+            if tools:
+                tool_calls = _extract_tool_calls(full_text, tools, tool_choice)
+            eff = getattr(turn, "effective", None)
+            if eff is not None and getattr(eff, "effective_mode", None):
+                catalog.mark_available(
+                    model,
+                    effective_mode=eff.effective_mode,
+                    effective_preset=eff.effective_preset,
+                    trial_left=eff.trial_left,
+                    trial_limit=eff.trial_limit,
+                )
+            yield {"kind": "finished", "full_text": full_text,
+                   "tool_calls": tool_calls, "last_turn": turn}
+            return
+
+
+def _clean_tool_markers(text: str) -> str:
+    """Убирает <tool_call>{...}</tool_call> из текста для output_text."""
+    import re as _re
+    return _re.sub(
+        r"<tool_call>\s*\{.*?\}\s*</tool_call>",
+        "", text or "", flags=_re.DOTALL,
+    ).strip()
+
+
+def _parse_responses_text_format(body: dict) -> tuple:
+    """Извлекает Responses-format из body и приводит к rf-структуре.
+
+    Responses API: {"text": {"format": {...}}}
+    Chat-style:    {"response_format": {...}}
+
+    Возвращает (rf, err). rf совместим с _validate_response_format.
+    """
+    text_field = body.get("text")
+    if text_field is not None and not isinstance(text_field, dict):
+        return None, {"error": {"message": "text must be an object",
+                                "type": "invalid_request_error"}}
+    fmt = None
+    if isinstance(text_field, dict):
+        fmt = text_field.get("format")
+    if fmt is None:
+        # fallback на Chat-style response_format (для совместимости)
+        rf = body.get("response_format")
+        if rf is not None:
+            return rf, None
+        return None, None
+    if not isinstance(fmt, dict):
+        return None, {"error": {"message": "text.format must be an object",
+                                "type": "invalid_request_error"}}
+    ftype = fmt.get("type")
+    if ftype in (None, "text"):
+        return {"type": "text"}, None
+    if ftype == "json_object":
+        return {"type": "json_object"}, None
+    if ftype == "json_schema":
+        # Responses: {type: "json_schema", name, schema, strict}
+        # Внутренний _validate_response_format ожидает {type, json_schema: {...}}
+        schema = fmt.get("schema")
+        if not isinstance(schema, dict):
+            return None, {"error": {"message": "text.format.schema is required "
+                                              "for json_schema type",
+                                    "type": "invalid_request_error"}}
+        return {"type": "json_schema",
+                "json_schema": {
+                    "name": fmt.get("name") or "response",
+                    "schema": schema,
+                    "strict": bool(fmt.get("strict")),
+                }}, None
+    return None, {"error": {"message": f"text.format.type={ftype!r} is not supported "
+                                        f"(supported: text, json_object, json_schema)",
+                            "type": "invalid_request_error"}}
 
 
 async def _run_alice_collect(session, prompt, agent_id, tools, tool_choice,
@@ -600,22 +774,10 @@ def _new_response_id() -> str:
 def _format_responses_output(text: str, tool_calls: list, tools_in: list) -> list:
     """Формирует output items для Responses API.
 
-    Возвращает список items: function_call items (если есть tool_calls) +
-    message item с output_text.
+    Порядок: message (если есть текст) → function_call items.
+    Этот порядок совпадает с streaming-путём. Пустой текст не даёт message.
     """
     out = []
-    for tc in tool_calls:
-        fn = tc.get("function") or {}
-        out.append({
-            "type": "function_call",
-            "id": f"fc_{uuid.uuid4().hex[:20]}",
-            "call_id": tc["id"],
-            "name": fn.get("name", ""),
-            "arguments": fn.get("arguments", "{}"),
-            "status": "completed",
-        })
-    # Если есть только tool_calls и нет текста — message не добавляем.
-    # Если есть текст — добавляем message с output_text.
     if text:
         out.append({
             "type": "message",
@@ -628,7 +790,48 @@ def _format_responses_output(text: str, tool_calls: list, tools_in: list) -> lis
                 "annotations": [],
             }],
         })
+    for tc in tool_calls:
+        fn = tc.get("function") or {}
+        out.append({
+            "type": "function_call",
+            "id": f"fc_{uuid.uuid4().hex[:20]}",
+            "call_id": tc["id"],
+            "name": fn.get("name", ""),
+            "arguments": fn.get("arguments", "{}"),
+            "status": "completed",
+        })
     return out
+
+
+def _check_api_key(request):
+    """Возвращает JSONResponse(401) или None.
+
+    Проверка включается, если задан ALICE_API_KEY (env). Без ключа — пропускает.
+    Сравнение через hmac.compare_digest.
+    """
+    from fastapi.responses import JSONResponse
+    import os as _os
+    import hmac as _hmac
+    expected = (_os.environ.get("ALICE_API_KEY") or "").strip()
+    if not expected:
+        return None
+    header = request.headers.get("Authorization", "")
+    if not header.startswith("Bearer "):
+        return JSONResponse(
+            {"error": {"message": "missing or invalid Authorization header "
+                                   "(expected 'Bearer <api_key>')",
+                       "type": "invalid_request_error"}},
+            status_code=401,
+        )
+    provided = header[len("Bearer "):].strip()
+    if not provided or not _hmac.compare_digest(provided.encode("utf-8"),
+                                                 expected.encode("utf-8")):
+        return JSONResponse(
+            {"error": {"message": "invalid API key",
+                       "type": "invalid_request_error"}},
+            status_code=401,
+        )
+    return None
 
 
 def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
@@ -641,6 +844,14 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
     """
     from fastapi.responses import JSONResponse, StreamingResponse
     from starlette.routing import Route
+
+    @app.middleware("http")
+    async def _v1_auth_middleware(request, call_next):
+        if request.url.path.startswith("/v1/"):
+            err = _check_api_key(request)
+            if err is not None:
+                return err
+        return await call_next(request)
 
     response_store = ResponseStore()
 
@@ -782,6 +993,11 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
                             status_code=502,
                         )
                     last = turn
+            except SessionConflictError as e:
+                return JSONResponse(
+                    {"error": {"message": str(e), "type": "session_conflict"}},
+                    status_code=409,
+                )
             except Exception as e:
                 return JSONResponse(
                     {"error": {"message": str(e), "type": "server_error"}},
@@ -798,6 +1014,59 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
                     trial_limit=eff.trial_limit,
                 )
             tool_calls = _extract_tool_calls(text, tools, tool_choice)
+
+            _forced = _forced_function_name(tool_choice)
+            if _forced:
+                wrong = [c["function"]["name"] for c in tool_calls
+                         if c["function"]["name"] != _forced]
+                if not tool_calls or wrong:
+                    return JSONResponse(
+                        {"error": {"message": f"tool_choice required function "
+                                              f"{_forced!r} but model produced "
+                                              f"{'no call' if not tool_calls else wrong}",
+                                   "type": "tool_choice_violated"}},
+                        status_code=422,
+                    )
+
+            # chat non-stream: args validation + retry
+            if tool_calls and tools:
+                valid, invalid = _validate_tool_calls_args(tool_calls, tools)
+                if invalid:
+                    err_msgs = "; ".join(
+                        f"{c['function']['name']}: {e}" for c, e in invalid
+                    )
+                    retry_prompt = (
+                        prompt
+                        + f"\n\n[RETRY: invalid tool args: {err_msgs}. "
+                          f"Re-emit the tool_call with arguments matching the schema.]"
+                    )
+                    last2 = None
+                    try:
+                        async for turn in session.send_message(retry_prompt, agent_id=agent_id):
+                            if getattr(turn, "error", None):
+                                break
+                            last2 = turn
+                    except Exception:
+                        pass
+                    if last2 is not None:
+                        text = last2.text or ""
+                        tool_calls = _extract_tool_calls(text, tools, tool_choice)
+                        valid, invalid = _validate_tool_calls_args(tool_calls, tools)
+                        if invalid:
+                            return JSONResponse(
+                                {"error": {"message": f"tool args invalid after retry: {err_msgs}",
+                                           "type": "tool_arguments_invalid"}},
+                                status_code=422,
+                            )
+                        tool_calls = valid
+                    else:
+                        return JSONResponse(
+                            {"error": {"message": f"tool args invalid: {err_msgs}",
+                                       "type": "tool_arguments_invalid"}},
+                            status_code=422,
+                        )
+                else:
+                    tool_calls = valid
 
             # tool_choice=required: bounded retry (1 повторная попытка)
             # если модель не вызвала инструмент. Это НЕ гарантия модели, но
@@ -872,7 +1141,28 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
             # а ждём is_finished и отдаём delta.tool_calls + finish_reason="tool_calls".
             buffering_for_tools = bool(tools)
             try:
-                async for turn in session.send_message(prompt, agent_id=agent_id):
+                _agen = session.send_message(prompt, agent_id=agent_id)
+                try:
+                    _first = await _agen.__anext__()
+                except StopAsyncIteration:
+                    return
+                except SessionConflictError as _e:
+                    yield _sse({
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "error": {"message": str(_e), "type": "session_conflict"},
+                    })
+                    yield "data: [DONE]\n\n"
+                    return
+
+                async def _chain(first, agen):
+                    yield first
+                    async for _t in agen:
+                        yield _t
+
+                async for turn in _chain(_first, _agen):
                     if getattr(turn, "error", None):
                         yield _sse({
                             "id": completion_id,
@@ -905,6 +1195,26 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
                                 yield "data: [DONE]\n\n"
                                 return
 
+                            # chat stream: args validation (без retry — SSE уже стартовал)
+                            if tool_calls and tools:
+                                _valid, _invalid = _validate_tool_calls_args(tool_calls, tools)
+                                if _invalid:
+                                    _err = "; ".join(f"{c['function']['name']}: {e}"
+                                                     for c, e in _invalid)
+                                    yield _sse({
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": model,
+                                        "error": {
+                                            "message": f"tool args invalid: {_err}",
+                                            "type": "tool_arguments_invalid",
+                                        },
+                                    })
+                                    yield "data: [DONE]\n\n"
+                                    return
+                                tool_calls = _valid
+
                             if tool_choice == "required" and not tool_calls:
                                 yield _sse({
                                     "id": completion_id,
@@ -919,6 +1229,26 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
                                 })
                                 yield "data: [DONE]\n\n"
                                 return
+
+                            _forced = _forced_function_name(tool_choice)
+                            if _forced:
+                                wrong = [c["function"]["name"] for c in tool_calls
+                                         if c["function"]["name"] != _forced]
+                                if not tool_calls or wrong:
+                                    yield _sse({
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": model,
+                                        "error": {
+                                            "message": f"tool_choice required function "
+                                                       f"{_forced!r} but model produced "
+                                                       f"{'no call' if not tool_calls else wrong}",
+                                            "type": "tool_choice_violated",
+                                        },
+                                    })
+                                    yield "data: [DONE]\n\n"
+                                    return
 
                             if tool_calls:
                                 # Убираем маркеры из видимого контента — они не должны
@@ -1076,8 +1406,11 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
                 status_code=503,
             )
 
-        # response_format: валидация + prompt-инструкция
-        rf_suffix, rf_err = _validate_response_format(body.get("response_format"))
+        # text.format (Responses) или response_format (Chat-style fallback).
+        rf_raw, rf_parse_err = _parse_responses_text_format(body)
+        if rf_parse_err is not None:
+            return JSONResponse(rf_parse_err, status_code=400)
+        rf_suffix, rf_err = _validate_response_format(rf_raw)
         if rf_err is not None:
             return JSONResponse(rf_err, status_code=400)
 
@@ -1154,15 +1487,28 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
         # previous_response_id фиксирует dialog_id и session_id предыдущего ответа
         # (по контракту OpenAI Responses continuation).
         if prev_entry is not None:
-            forced_session_id = prev_entry.get("session_id")
+            prev_session_id = prev_entry.get("session_id")
             prev_dialog_id = prev_entry.get("dialog_id")
         else:
-            forced_session_id = None
+            prev_session_id = None
             prev_dialog_id = None
 
-        session_id = (request.headers.get("X-Alice-Session-ID")
-                      or (body.get("metadata") or {}).get("session_id")
-                      or forced_session_id)
+        explicit_sid = (request.headers.get("X-Alice-Session-ID")
+                        or (body.get("metadata") or {}).get("session_id"))
+        # Owner check: если у предыдущего response есть session_id, и текущий
+        # запрос передаёт ДРУГОЙ session_id — отказ (не даём клиенту B
+        # продолжить response клиента A, зная только response_id).
+        if prev_session_id and explicit_sid and explicit_sid != prev_session_id:
+            return JSONResponse(
+                {"error": {"message": "previous_response_id belongs to a "
+                                      "different session; not allowed",
+                           "type": "previous_response_not_owned"}},
+                status_code=403,
+            )
+        # Если previous_response_id передан и client_sid не указан —
+        # восстанавливаем из prev_entry. Это легально: клиент хранит
+        # response_id как capability.
+        session_id = explicit_sid or prev_session_id
         try:
             session = await session_registry.acquire(session_id)
         except Exception as e:
@@ -1189,6 +1535,11 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
                     session, prompt, agent_id, canonical_tools,
                     tool_choice, catalog, model,
                 )
+            except SessionConflictError as e:
+                return JSONResponse(
+                    {"error": {"message": str(e), "type": "session_conflict"}},
+                    status_code=409,
+                )
             except RuntimeError as e:
                 return JSONResponse(
                     {"error": {"message": str(e), "type": "upstream_error"}},
@@ -1199,7 +1550,61 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
                     {"error": {"message": str(e), "type": "server_error"}},
                     status_code=500,
                 )
-            output = _format_responses_output(text, tool_calls, canonical_tools)
+            _forced = _forced_function_name(tool_choice)
+            if _forced:
+                wrong = [c["function"]["name"] for c in tool_calls
+                         if c["function"]["name"] != _forced]
+                if not tool_calls or wrong:
+                    return JSONResponse(
+                        {"error": {"message": f"tool_choice required function "
+                                              f"{_forced!r} but model produced "
+                                              f"{'no call' if not tool_calls else wrong}",
+                                   "type": "tool_choice_violated"}},
+                        status_code=422,
+                    )
+            # responses non-stream: args validation + retry
+            if tool_calls and canonical_tools:
+                valid, invalid = _validate_tool_calls_args(tool_calls, canonical_tools)
+                if invalid:
+                    err_msgs = "; ".join(
+                        f"{c['function']['name']}: {e}" for c, e in invalid
+                    )
+                    retry_prompt = (
+                        prompt
+                        + f"\n\n[RETRY: invalid tool args: {err_msgs}. "
+                          f"Re-emit with valid args matching the schema.]"
+                    )
+                    last2 = None
+                    try:
+                        async for t2 in session.send_message(retry_prompt, agent_id=agent_id):
+                            if getattr(t2, "error", None):
+                                break
+                            last2 = t2
+                    except Exception:
+                        pass
+                    if last2 is not None:
+                        text = last2.text or ""
+                        tool_calls = _extract_tool_calls(text, canonical_tools, tool_choice)
+                        valid, invalid = _validate_tool_calls_args(
+                            tool_calls, canonical_tools)
+                        if invalid:
+                            return JSONResponse(
+                                {"error": {"message": f"tool args invalid after retry: {err_msgs}",
+                                           "type": "tool_arguments_invalid"}},
+                                status_code=422,
+                            )
+                        tool_calls = valid
+                    else:
+                        return JSONResponse(
+                            {"error": {"message": f"tool args invalid: {err_msgs}",
+                                       "type": "tool_arguments_invalid"}},
+                            status_code=422,
+                        )
+                else:
+                    tool_calls = valid
+
+            clean_text = _clean_tool_markers(text) if tool_calls else text
+            output = _format_responses_output(clean_text, tool_calls, canonical_tools)
             if store_response:
                 try:
                     did = getattr(session, "dialog_id", None)
@@ -1226,6 +1631,8 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
             return f"event: {type_}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
         async def streamer():
+            # Реальный streaming: события эмитятся по мере прихода turn-ов.
+            # Не ждём is_finished, не собираем весь текст заранее.
             yield await _event("response.created", {
                 "type": "response.created",
                 "response": {
@@ -1236,103 +1643,171 @@ def attach_openai_routes(app, catalog: ModelCatalog, session_registry) -> None:
                     "model": model,
                 },
             })
-            seq = 0
+            msg_item_id = f"msg_{uuid.uuid4().hex[:20]}"
+            msg_started = False
+            full_text_acc = ""
+            output_items = []
             try:
-                text, tool_calls, _last = await _run_alice_collect(
+                async for ev in _run_alice_stream(
                     session, prompt, agent_id, canonical_tools,
                     tool_choice, catalog, model,
-                )
-            except Exception as e:
-                yield await _event("response.error", {
-                    "type": "response.error",
+                ):
+                    if ev["kind"] == "text_delta":
+                        delta = ev["text"]
+                        full_text_acc += delta
+                        if not msg_started:
+                            msg_started = True
+                            yield await _event("response.output_item.added", {
+                                "type": "response.output_item.added",
+                                "response_id": response_id,
+                                "output_index": 0,
+                                "item": {
+                                    "type": "message",
+                                    "id": msg_item_id,
+                                    "role": "assistant",
+                                    "status": "in_progress",
+                                    "content": [],
+                                },
+                            })
+                            yield await _event("response.content_part.added", {
+                                "type": "response.content_part.added",
+                                "response_id": response_id,
+                                "item_id": msg_item_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "part": {"type": "output_text",
+                                         "text": "", "annotations": []},
+                            })
+                        yield await _event("response.output_text.delta", {
+                            "type": "response.output_text.delta",
+                            "response_id": response_id,
+                            "item_id": msg_item_id,
+                            "output_index": 0,
+                            "content_index": 0,
+                            "delta": delta,
+                        })
+                    elif ev["kind"] == "finished":
+                        tool_calls = ev["tool_calls"]
+                        full_text = ev["full_text"]
+                        # responses stream: args validation (без retry — SSE стартовал)
+                        if tool_calls and canonical_tools:
+                            _valid, _invalid = _validate_tool_calls_args(
+                                tool_calls, canonical_tools)
+                            if _invalid:
+                                _err = "; ".join(
+                                    f"{c['function']['name']}: {e}" for c, e in _invalid)
+                                yield await _event("response.failed", {
+                                    "type": "response.failed",
+                                    "response_id": response_id,
+                                    "error": {
+                                        "type": "tool_arguments_invalid",
+                                        "message": _err,
+                                    },
+                                })
+                                return
+                            tool_calls = _valid
+                        cleaned = _clean_tool_markers(full_text) if tool_calls else full_text
+                        if msg_started:
+                            yield await _event("response.output_text.done", {
+                                "type": "response.output_text.done",
+                                "response_id": response_id,
+                                "item_id": msg_item_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "text": cleaned,
+                            })
+                            msg_item_final = {
+                                "type": "message",
+                                "id": msg_item_id,
+                                "role": "assistant",
+                                "status": "completed",
+                                "content": [{
+                                    "type": "output_text",
+                                    "text": cleaned,
+                                    "annotations": [],
+                                }],
+                            }
+                            yield await _event("response.output_item.done", {
+                                "type": "response.output_item.done",
+                                "response_id": response_id,
+                                "output_index": 0,
+                                "item": msg_item_final,
+                            })
+                            output_items.append(msg_item_final)
+                        fc_idx = len(output_items)
+                        for tc in tool_calls:
+                            fn = tc.get("function") or {}
+                            fc_item = {
+                                "type": "function_call",
+                                "id": f"fc_{uuid.uuid4().hex[:20]}",
+                                "call_id": tc["id"],
+                                "name": fn.get("name", ""),
+                                "arguments": fn.get("arguments", "{}"),
+                                "status": "completed",
+                            }
+                            yield await _event("response.output_item.added", {
+                                "type": "response.output_item.added",
+                                "response_id": response_id,
+                                "output_index": fc_idx,
+                                "item": fc_item,
+                            })
+                            yield await _event("response.function_call_arguments.done", {
+                                "type": "response.function_call_arguments.done",
+                                "response_id": response_id,
+                                "item_id": fc_item["id"],
+                                "output_index": fc_idx,
+                                "call_id": fc_item["call_id"],
+                                "name": fc_item["name"],
+                                "arguments": fc_item["arguments"],
+                            })
+                            yield await _event("response.output_item.done", {
+                                "type": "response.output_item.done",
+                                "response_id": response_id,
+                                "output_index": fc_idx,
+                                "item": fc_item,
+                            })
+                            output_items.append(fc_item)
+                            fc_idx += 1
+                        if store_response:
+                            try:
+                                did = getattr(session, "dialog_id", None)
+                                response_store.put(response_id, did or "", model, session_id)
+                            except Exception:
+                                pass
+                        yield await _event("response.completed", {
+                            "type": "response.completed",
+                            "response": {
+                                "id": response_id,
+                                "object": "response",
+                                "created_at": created_at,
+                                "status": "completed",
+                                "model": model,
+                                "output": output_items,
+                                "usage": None,
+                            },
+                        })
+                        return
+            except SessionConflictError as e:
+                yield await _event("response.failed", {
+                    "type": "response.failed",
                     "response_id": response_id,
-                    "error": {"type": "upstream_error", "message": str(e)},
-                })
-                yield await _event("response.completed", {
-                    "type": "response.completed",
-                    "response": {
-                        "id": response_id,
-                        "status": "failed",
-                        "error": {"type": "upstream_error", "message": str(e)},
+                    "error": {
+                        "type": "session_conflict",
+                        "message": str(e),
                     },
                 })
                 return
-
-            output = _format_responses_output(text, tool_calls, canonical_tools)
-            # эмитим items в порядке
-            for idx, item in enumerate(output):
-                seq += 1
-                yield await _event("response.output_item.added", {
-                    "type": "response.output_item.added",
+            except Exception as e:
+                # Правильный event для ошибки — response.failed (не completed/failed).
+                yield await _event("response.failed", {
+                    "type": "response.failed",
                     "response_id": response_id,
-                    "output_index": idx,
-                    "item": item,
+                    "error": {
+                        "type": "upstream_error",
+                        "message": str(e),
+                    },
                 })
-                if item["type"] == "function_call":
-                    seq += 1
-                    yield await _event("response.function_call_arguments.done", {
-                        "type": "response.function_call_arguments.done",
-                        "response_id": response_id,
-                        "item_id": item["id"],
-                        "output_index": idx,
-                        "call_id": item["call_id"],
-                        "name": item["name"],
-                        "arguments": item["arguments"],
-                    })
-                elif item["type"] == "message":
-                    seq += 1
-                    yield await _event("response.content_part.added", {
-                        "type": "response.content_part.added",
-                        "response_id": response_id,
-                        "item_id": item["id"],
-                        "output_index": idx,
-                        "content_index": 0,
-                        "part": item["content"][0],
-                    })
-                    seq += 1
-                    yield await _event("response.output_text.delta", {
-                        "type": "response.output_text.delta",
-                        "response_id": response_id,
-                        "item_id": item["id"],
-                        "output_index": idx,
-                        "content_index": 0,
-                        "delta": text,
-                    })
-                    seq += 1
-                    yield await _event("response.output_text.done", {
-                        "type": "response.output_text.done",
-                        "response_id": response_id,
-                        "item_id": item["id"],
-                        "output_index": idx,
-                        "content_index": 0,
-                        "text": text,
-                    })
-                seq += 1
-                yield await _event("response.output_item.done", {
-                    "type": "response.output_item.done",
-                    "response_id": response_id,
-                    "output_index": idx,
-                    "item": item,
-                })
-
-            if store_response:
-                try:
-                    did = getattr(session, "dialog_id", None)
-                    response_store.put(response_id, did or "", model, session_id)
-                except Exception:
-                    pass
-            yield await _event("response.completed", {
-                "type": "response.completed",
-                "response": {
-                    "id": response_id,
-                    "object": "response",
-                    "created_at": created_at,
-                    "status": "completed",
-                    "model": model,
-                    "output": output,
-                    "usage": None,
-                },
-            })
+                return
 
         return StreamingResponse(streamer(), media_type="text/event-stream")
 

@@ -282,6 +282,6 @@ def test_responses_stream_upstream_error():
         "model": "alice-base", "input": "x", "stream": True,
     })
     assert r.status_code == 200
-    # В SSE — response.error + completed с status=failed
-    assert "response.error" in r.text
-    assert '"status": "failed"' in r.text
+    # Upstream error → response.failed (не completed/failed)
+    assert "response.failed" in r.text
+    assert "response.completed" not in r.text

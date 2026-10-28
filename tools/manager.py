@@ -212,6 +212,15 @@ class AliceAgentManager:
             pass
 
 
+class SessionConflictError(RuntimeError):
+    """Один ChatSession — не более одного активного запроса за раз.
+
+    Backend Алисы работает с одним dialog_id; параллельные ходы в нём
+    смешивают историю, ломают отмену и не гарантируют изоляцию.
+    Gateway возвращает 409 session_conflict.
+    """
+
+
 class ChatSession:
     """Изолированная сессия для одного HTTP-клиента OpenAI-совместимого API."""
 
@@ -233,9 +242,16 @@ class ChatSession:
 
     async def send_message(self, text: str, agent_id: str = "pro",
                            is_suggest: bool = False):
-        did = await self.ensure_dialog(agent_id)
-        self._active += 1
+        # Один активный запрос на сессию. Второй — SessionConflictError.
+        # Проверка и захват _active атомарны относительно event loop
+        # (нет await между проверкой и установкой).
+        if self._active > 0:
+            raise SessionConflictError(
+                f"session {self.session_id} already has an active request"
+            )
+        self._active = 1
         try:
+            did = await self.ensure_dialog(agent_id)
             async for turn in self.manager.send_message(
                 text=text, agent_id=agent_id, dialog_id=did, is_suggest=is_suggest,
             ):
@@ -243,7 +259,7 @@ class ChatSession:
                     self._current_req_id = turn.request_id
                 yield turn
         finally:
-            self._active -= 1
+            self._active = 0
             self._current_req_id = None
 
     async def cancel_current(self) -> None:
@@ -268,7 +284,15 @@ class ChatSession:
             pass
 
     async def close(self, delete_dialog: bool = True):
-        await self.cancel_current()
+        # Если есть активный запрос — сначала попросить его завершиться
+        # (cancel_current кладёт error turn в очередь), затем дождаться,
+        # пока generator дойдёт до finally и обнулит _active.
+        if self._active > 0:
+            await self.cancel_current()
+            for _ in range(50):  # до 5 секунд
+                if self._active == 0:
+                    break
+                await asyncio.sleep(0.1)
         did = self.dialog_id
         if delete_dialog and did:
             try:

@@ -3,3 +3,4 @@ aioconsole
 fastapi
 uvicorn
 aiohttp
+jsonschema>=4.0
