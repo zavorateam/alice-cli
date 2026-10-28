@@ -188,6 +188,29 @@ class AliceAgentManager:
         await self.cleanup_ephemeral_dialogs()
         await self.ws.disconnect()
 
+    async def _on_dialog_closed(self, dialog_id: str) -> None:
+        """Согласованная очистка структур manager при закрытии диалога.
+
+        Вызывается из ChatSession.close() и AliceAgentManager.cleanup_ephemeral_dialogs().
+        Не трогает активные запросы: если dialog_id в _pending (по ref_id), вызов
+        блокируется до завершения; для eviction in-flight защищён на уровне реестра.
+        """
+        if not dialog_id:
+            return
+        self.known_dialogs.discard(dialog_id)
+        self.ephemeral_dialogs.discard(dialog_id)
+        self.dialog_prev_req_ids.pop(dialog_id, None)
+        # Транспорт: убрать из подписок, если диалог больше не активен
+        try:
+            ws = getattr(self, "ws", None)
+            if ws is not None and hasattr(ws, "update_subscriptions"):
+                await ws.update_subscriptions(
+                    self.active_dialog_id or dialog_id,
+                    self.known_dialogs,
+                )
+        except Exception:
+            pass
+
 
 class ChatSession:
     """Изолированная сессия для одного HTTP-клиента OpenAI-совместимого API."""
@@ -197,8 +220,8 @@ class ChatSession:
         self.manager = manager
         self.dialog_id: Optional[str] = None
         self._lock = asyncio.Lock()
-        # req_id текущего запроса — чтобы cancel_current() мог разбудить генератор
         self._current_req_id: Optional[str] = None
+        self._active = 0
 
     async def ensure_dialog(self, agent_id: str = "pro") -> str:
         async with self._lock:
@@ -208,8 +231,10 @@ class ChatSession:
                 )
             return self.dialog_id
 
-    async def send_message(self, text: str, agent_id: str = "pro", is_suggest: bool = False):
+    async def send_message(self, text: str, agent_id: str = "pro",
+                           is_suggest: bool = False):
         did = await self.ensure_dialog(agent_id)
+        self._active += 1
         try:
             async for turn in self.manager.send_message(
                 text=text, agent_id=agent_id, dialog_id=did, is_suggest=is_suggest,
@@ -218,19 +243,10 @@ class ChatSession:
                     self._current_req_id = turn.request_id
                 yield turn
         finally:
+            self._active -= 1
             self._current_req_id = None
 
     async def cancel_current(self) -> None:
-        """Разбудить текущий `send_text_input`, чтобы он вышел и очистил state.
-
-        Кладём в `queue` ошибку-cancellation, чтобы `while queue.get()` в
-        `ws.send_text_input` не висел до `agent.timeout`. После пробуждения
-        `send_text_input` попадёт в finally, удалит `_pending_responses[req_id]`,
-        `_active_agents_by_req[req_id]`, `requested_mode_by_req[req_id]`,
-        `effective_by_req[req_id]`.
-
-        Если запроса нет — no-op (нечего отменять).
-        """
         req_id = self._current_req_id
         if not req_id:
             return
@@ -252,28 +268,32 @@ class ChatSession:
             pass
 
     async def close(self, delete_dialog: bool = True):
-        # Если есть незавершённый запрос — разбудить его, чтобы не висел
         await self.cancel_current()
-        if delete_dialog and self.dialog_id:
+        did = self.dialog_id
+        if delete_dialog and did:
             try:
-                await self.manager.rpc.delete_dialog(self.dialog_id)
+                await self.manager.rpc.delete_dialog(did)
             except Exception:
                 pass
+        try:
+            on_close = getattr(self.manager, "_on_dialog_closed", None)
+            if on_close is not None and did:
+                await on_close(did)
+        except Exception:
+            pass
         self.dialog_id = None
 
 
 
+
+
 class SessionRegistry:
-    """Реестр ChatSession по X-Alice-Session-ID.
+    """Реестр ChatSession с TTL, MAX, backpressure.
 
-    - TTL: сессия удаляется после `_ttl_seconds` простоя (по умолчанию 1 час).
-    - MAX_SESSIONS: до добавления нового sid освобождаем место так, чтобы
-      после добавления `len <= max`. Удаляются самые старые по `last_used_at`.
-    - Очистка lazy, при `acquire()` — без фонового таймера.
-
-    Factory возвращает готовый (уже инициализированный) AliceAgentManager.
-    Для shared-manager сценария factory = lambda: manager — shutdown()
-    менеджера НЕ вызывается из ChatSession.close() (владелец — сервер).
+    - TTL: сессии с истёкшим TTL удаляются при acquire.
+    - MAX: при переполнении удаляются неактивные LRU; если все активны —
+      acquire() бросает RuntimeError (backpressure).
+    - Активные сессии (chat._active > 0) НЕ вытесняются ни по TTL, ни по MAX.
     """
 
     DEFAULT_TTL = 3600.0
@@ -289,18 +309,21 @@ class SessionRegistry:
         self._ttl = self.DEFAULT_TTL if ttl_seconds is None else ttl_seconds
         self._max = max_sessions
 
-    async def _close_one_locked(self, sid: str):
-        """Удалить одну сессию (под self._lock)."""
-        chat = self._sessions.pop(sid, None)
+    async def _close_one_locked(self, sid: str, allow_active: bool = False) -> bool:
+        chat = self._sessions.get(sid)
+        if chat is None:
+            return True
+        if getattr(chat, "_active", 0) > 0 and not allow_active:
+            return False
+        self._sessions.pop(sid, None)
         self._last_used.pop(sid, None)
-        if chat is not None:
-            try:
-                await chat.close(delete_dialog=True)
-            except Exception:
-                pass
+        try:
+            await chat.close(delete_dialog=True)
+        except Exception:
+            pass
+        return True
 
     async def _evict_ttl_locked(self):
-        """Удалить все сессии, не использованные дольше TTL."""
         import time as _time
         if self._ttl <= 0:
             return
@@ -308,19 +331,22 @@ class SessionRegistry:
         expired = [sid for sid, ts in self._last_used.items()
                    if now - ts > self._ttl]
         for sid in expired:
-            await self._close_one_locked(sid)
+            await self._close_one_locked(sid, allow_active=False)
 
-    async def _make_room_locked(self, incoming: int = 1):
-        """Удалить старейшие, чтобы после добавления `incoming` новых sid
-        выполнялось `len(self._sessions) + incoming <= self._max`."""
+    async def _make_room_locked(self, incoming: int = 1) -> bool:
         if self._max <= 0:
-            return
+            return True
         overflow = len(self._sessions) + incoming - self._max
         if overflow <= 0:
-            return
+            return True
         ordered = sorted(self._last_used.items(), key=lambda kv: kv[1])
-        for sid, _ts in ordered[:overflow]:
-            await self._close_one_locked(sid)
+        freed = 0
+        for sid, _ts in ordered:
+            if freed >= overflow:
+                break
+            if await self._close_one_locked(sid, allow_active=False):
+                freed += 1
+        return freed >= overflow
 
     async def acquire(self, session_id: Optional[str]) -> ChatSession:
         import time as _time
@@ -330,7 +356,11 @@ class SessionRegistry:
             if sid in self._sessions:
                 self._last_used[sid] = _time.time()
                 return self._sessions[sid]
-            await self._make_room_locked(incoming=1)
+            if not await self._make_room_locked(incoming=1):
+                raise RuntimeError(
+                    f"SessionRegistry at capacity ({self._max}); "
+                    f"all sessions are active, retry later"
+                )
             mgr = await self._factory()
             self._sessions[sid] = ChatSession(sid, mgr)
             self._last_used[sid] = _time.time()
@@ -345,6 +375,8 @@ class SessionRegistry:
 
     def __len__(self) -> int:
         return len(self._sessions)
+
+
 
 
 
@@ -529,38 +561,51 @@ class AliceMcpServer:
         )
         writer = asyncio.StreamWriter(writer_transport, writer_protocol, reader, asyncio.get_running_loop())
 
-        while True:
-            line = await reader.readline()
-            if not line:
-                break
-            line_str = line.decode("utf-8").strip()
-            if not line_str:
-                continue
-            try:
-                req = json.loads(line_str)
-                req_id = req.get("id")
-                method = req.get("method")
-                params = req.get("params", {})
-                if method == "initialize":
-                    res = {"jsonrpc": "2.0", "id": req_id, "result": {
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "yandex-alice-server", "version": "4.6.0"},
-                    }}
-                elif method == "notifications/initialized":
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                line_str = line.decode("utf-8").strip()
+                if not line_str:
                     continue
-                elif method == "tools/list":
-                    res = {"jsonrpc": "2.0", "id": req_id, "result": {"tools": self._get_tools_definition()}}
-                elif method == "tools/call":
-                    call_result = await self.handle_tool_call(params.get("name"), params.get("arguments", {}))
-                    res = {"jsonrpc": "2.0", "id": req_id, "result": call_result}
-                elif method == "ping":
-                    res = {"jsonrpc": "2.0", "id": req_id, "result": {}}
-                else:
-                    res = {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": "Method not found"}}
-                writer.write((json.dumps(res, ensure_ascii=False) + "\n").encode("utf-8"))
-                await writer.drain()
-            except Exception as e:
-                err = {"jsonrpc": "2.0", "id": None, "error": {"code": -32603, "message": str(e)}}
-                writer.write((json.dumps(err) + "\n").encode("utf-8"))
-                await writer.drain()
+                try:
+                    req = json.loads(line_str)
+                    req_id = req.get("id")
+                    method = req.get("method")
+                    params = req.get("params", {})
+                    if method == "initialize":
+                        res = {"jsonrpc": "2.0", "id": req_id, "result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "yandex-alice-server", "version": "4.6.0"},
+                        }}
+                    elif method == "notifications/initialized":
+                        continue
+                    elif method == "tools/list":
+                        res = {"jsonrpc": "2.0", "id": req_id, "result": {"tools": self._get_tools_definition()}}
+                    elif method == "tools/call":
+                        call_result = await self.handle_tool_call(params.get("name"), params.get("arguments", {}))
+                        res = {"jsonrpc": "2.0", "id": req_id, "result": call_result}
+                    elif method == "ping":
+                        res = {"jsonrpc": "2.0", "id": req_id, "result": {}}
+                    else:
+                        res = {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": "Method not found"}}
+                    writer.write((json.dumps(res, ensure_ascii=False) + "\n").encode("utf-8"))
+                    await writer.drain()
+                except Exception as e:
+                    # Не утекаем трейсбек клиенту — только тип и безопасное сообщение
+                    err = {"jsonrpc": "2.0", "id": None,
+                           "error": {"code": -32603,
+                                     "message": f"internal error: {type(e).__name__}"}}
+                    try:
+                        writer.write((json.dumps(err) + "\n").encode("utf-8"))
+                        await writer.drain()
+                    except Exception:
+                        pass
+        finally:
+            # Закрыть все кэшированные менеджеры (WS + ephemeral dialogs)
+            try:
+                await self._shutdown_all()
+            except Exception:
+                pass

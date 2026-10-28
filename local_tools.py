@@ -487,6 +487,13 @@ async def load_tools_from_config_async(config_path: str) -> LocalToolRegistry:
 
     sc = cfg.get("shell") or {}
     if sc.get("enabled", True):
+        if not sc.get("strict", True):
+            logger.warning(
+                "shell.strict=false: пайпы и && разрешены. blocklist по первым "
+                "токенам не является security boundary — команда с обфускацией "
+                "или подобранным путём может обойти его. Используйте только "
+                "для доверенных агентов/пользователей."
+            )
         reg.register(ShellTool(
             allowed=sc.get("allowed_commands"),
             cwd=sc.get("working_directory"),
@@ -497,8 +504,22 @@ async def load_tools_from_config_async(config_path: str) -> LocalToolRegistry:
 
     fc = cfg.get("files") or {}
     if fc:
-        read_root = fc.get("root", "/")
+        # Безопасные дефолты: НЕ "/" (открывает всю ФС). Если пользователь
+        # явно хочет "/", пусть пишет "root": "/" и получает warning в логе.
+        read_root = fc.get("root", "~")
         write_root = fc.get("write_root", "~/Downloads")
+        # Защита от случайного root="/" (или пустой строки, которая в
+        # os.path.expanduser → "" → realpath("") → cwd, что ещё хуже)
+        if read_root in ("", "/"):
+            logger.warning(
+                f"files.root={read_root!r} открывает широкий доступ к ФС; "
+                f"используем '~' как безопасный дефолт. Если нужен именно "
+                f"'/' — задайте явно в конфиге и понимайте риск."
+            )
+            read_root = "~"
+        if write_root in ("", "/"):
+            logger.warning(f"files.write_root={write_root!r} заменён на '~/Downloads'")
+            write_root = "~/Downloads"
         if fc.get("read_enabled", True):
             reg.register(ReadFileTool(root=read_root))
         if fc.get("list_enabled", True):

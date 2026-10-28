@@ -266,13 +266,27 @@ class AliceWsEngine:
                     await self._open()
                     self._listener_task = asyncio.create_task(self._listen_loop(), name="alice-ws-listener")
                     self._running_task = self._listener_task
-                    await self._synchronize_state()
                     try:
+                        await self._synchronize_state()
                         await asyncio.wait_for(self._sync_event.wait(), timeout=7.0)
                         if self.verbose:
                             logger.info(f"Сессия Uniproxy: {self.session_id}")
                     except asyncio.TimeoutError:
                         logger.warning("Таймаут SynchronizeStateResponse (reconnect)")
+                    except Exception as sync_err:
+                        # Handshake провалился после _open — сброс состояния,
+                        # чтобы следующая итерация не считала транспорт живым.
+                        logger.warning(f"WS sync failed: {sync_err!r}; reset")
+                        self.is_connected = False
+                        try:
+                            if self.ws is not None:
+                                await self.ws.close()
+                        except Exception:
+                            pass
+                        self.ws = None
+                        if self._listener_task is not None and not self._listener_task.done():
+                            self._listener_task.cancel()
+                        raise
                     await self._flush_subscriptions()
                     self._reconnect_backoff = 2.0
                     logger.info("WS reconnected")
