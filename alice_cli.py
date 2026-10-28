@@ -763,6 +763,17 @@ async def async_main():
     parser.add_argument("--dialog-id", default=None)
     args = parser.parse_args()
 
+    # --verbose включает INFO-логи из tools.transport/manager.
+    # Без этого logger.info("TEXTINPUT ...")/("VinsResponse ...") из WS-движка
+    # не выводятся: root logger default = WARNING. Live-прогон 2026-10-28
+    # показал, что `-v` пользователю ничего не даёт.
+    if args.verbose:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            stream=sys.stderr,
+        )
+
     creds = load_credentials_with_cookies(
         token_source=args.auth or args.token,
         cookies_source=args.cookies,
